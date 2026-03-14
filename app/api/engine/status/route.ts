@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { BotDatabase } from "@/scripts/db";
 import { isEngineRunning } from "@/lib/server/engine-process";
+import { proxyEngine } from "@/lib/server/engine-proxy";
 import type { GridConfig } from "@/lib/grid-bot";
 import path from "path";
 
@@ -11,6 +12,8 @@ function openDb(): BotDatabase {
 
 export async function GET() {
   try {
+    const proxied = await proxyEngine("status", "GET");
+    if (proxied !== null) return NextResponse.json(proxied);
     const db = openDb();
 
     const botStatus        = db.getConfig<string>("bot_status");
@@ -25,11 +28,16 @@ export async function GET() {
     const pair             = config?.pair ?? "";
     const orders           = pair ? db.getOrderHistory(pair, 20) : [];
 
-    db.close();
-
     // El proceso puede haber muerto pero la DB dice "running" → reconciliar
     const processRunning = isEngineRunning();
-    const isRunning = processRunning || botStatus === "running";
+    // Si el proceso no está activo pero la DB dice "running" (estado stale tras redeploy),
+    // limpiar el flag para que la UI no quede bloqueada
+    if (!processRunning && botStatus === "running") {
+      db.setConfig("bot_status", "stopped");
+    }
+    db.close();
+
+    const isRunning = processRunning;
 
     return NextResponse.json({
       ok: true,
