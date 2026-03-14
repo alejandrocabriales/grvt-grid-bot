@@ -1,4 +1,4 @@
-# fly.toml — GRVT Grid Bot (standalone engine 24/7)
+# fly.toml — GRVT Grid Bot (Next.js UI + engine servidor 24/7)
 app = 'grvt-grid-bot'
 primary_region = 'gru'
 
@@ -7,12 +7,19 @@ primary_region = 'gru'
 [env]
   GRVT_USE_TESTNET = "false"
   BOT_DB_PATH = "/data/bot-state.sqlite"
+  NODE_ENV = "production"
 
 [[mounts]]
   source      = "bot_data"
   destination = "/data"
 
+[http_service]
+  internal_port = 3000
+  force_https   = true
+  auto_stop_machines  = false
+  auto_start_machines = true
+
 [[vm]]
-  memory   = "256mb"
+  memory   = "512mb"
   cpu_kind = "shared"
   cpus     = 1
