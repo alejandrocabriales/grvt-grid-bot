@@ -13,7 +13,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { GridConfig, calculateMaxGrids } from "@/lib/grid-bot";
+import { GridConfig, calculateMaxGrids, detectMarketBiasLegacy } from "@/lib/grid-bot";
+import { calculateIndicators } from "@/lib/indicators";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -74,11 +75,23 @@ export function GridBotConfig({
 
   const [form, setForm] = useState({
     pair: "ETH_USDT_Perp",
+    strategyMode: "NEUTRAL_GRID" as GridConfig["strategyMode"],
     upperPrice: "",
     lowerPrice: "",
     gridCount: "5",
-    totalInvestment: "44",
+    totalInvestment: "100",
     leverage: "20",
+    stopLoss: "",
+    takeProfit: "",
+    atrMultiplier: "1.5",
+    riskPerTrade: "1.5",
+    maxDrawdownPct: "15",
+    enableTrailingStop: true,
+    trailingAtrMult: "2.0",
+    autoReposition: true,
+    trendFilterEnabled: true,
+    gridType: "GEOMETRIC" as GridConfig["gridType"],
+    autoRange: false,
   });
 
   // Live price for the selected pair
@@ -86,6 +99,11 @@ export function GridBotConfig({
   const [priceLoading, setPriceLoading] = useState(false);
   const [minSize, setMinSize] = useState(0.01);
   const [balance, setBalance] = useState<number | null>(null);
+  const [strategyTip, setStrategyTip] = useState<string | null>(null);
+  // Preset seleccionado (índice 0/1/2) para mostrar borde activo
+  const [selectedPresetIdx, setSelectedPresetIdx] = useState<number | null>(null);
+  // Sesgo de mercado detectado automáticamente al cargar el par
+  const [detectedBias, setDetectedBias] = useState<"BULLISH" | "BEARISH" | "NEUTRAL" | null>(null);
 
   // Verificar credenciales al montar (llama /api/credentials)
   useEffect(() => {
@@ -134,28 +152,48 @@ export function GridBotConfig({
     return () => clearInterval(interval);
   }, []);
 
-  // Fetch live price when pair changes
+  // Fetch live price + detectar sesgo de mercado cuando cambia el par
   useEffect(() => {
     let cancelled = false;
-    const fetchPrice = async () => {
+
+    const fetchPriceAndBias = async () => {
       setPriceLoading(true);
       setLivePrice(null);
+      setDetectedBias(null);
+      setSelectedPresetIdx(null); // Resetear selección al cambiar de par
       try {
+        // Precio e info del instrumento
         const res = await fetch(`/api/bot/price?instrument=${form.pair}`);
         const data = await res.json();
         if (!cancelled && data.price > 0) {
-          setLivePrice(data.price);
+          const price = data.price;
+          setLivePrice(price);
           if (data.minSize) setMinSize(parseFloat(data.minSize));
-          // Auto-fill with intraday range (±3% for max volume)
+          // Auto-fill de rango si está vacío
           setForm((f) => {
             const needsAutoFill = !f.lowerPrice && !f.upperPrice;
             if (needsAutoFill) {
-              const lower = Math.floor(data.price * 0.97);
-              const upper = Math.ceil(data.price * 1.03);
+              const lower = Math.floor(price * 0.97);
+              const upper = Math.ceil(price * 1.03);
               return { ...f, lowerPrice: String(lower), upperPrice: String(upper) };
             }
             return f;
           });
+
+          // Detectar sesgo del mercado en segundo plano (no bloquea el UI)
+          try {
+            const klinesRes = await fetch(
+              `/api/bot/klines?instrument=${form.pair}&interval=5m&limit=220`
+            );
+            const klinesData = await klinesRes.json();
+            if (!cancelled && klinesData.ok && klinesData.klines?.length > 0) {
+              const indicators = calculateIndicators(klinesData.klines);
+              const bias = detectMarketBiasLegacy(price, indicators.ema50, indicators.ema200, indicators.rsi);
+              setDetectedBias(bias);
+            }
+          } catch {
+            // Indicadores opcionales — no bloquear si fallan
+          }
         }
       } catch {
         // silently fail
@@ -163,13 +201,16 @@ export function GridBotConfig({
         if (!cancelled) setPriceLoading(false);
       }
     };
-    fetchPrice();
-    const interval = setInterval(fetchPrice, 15_000);
+
+    fetchPriceAndBias();
+    const interval = setInterval(fetchPriceAndBias, 30_000); // Cada 30s (no tan frecuente)
     return () => { cancelled = true; clearInterval(interval); };
   }, [form.pair]);
 
-  const set = (key: string) => (e: React.ChangeEvent<HTMLInputElement>) =>
+  const set = (key: string) => (e: React.ChangeEvent<HTMLInputElement>) => {
     setForm((f) => ({ ...f, [key]: e.target.value }));
+    if (key === "stopLoss" || key === "takeProfit") setStrategyTip(null);
+  };
 
   const gridStep =
     (parseFloat(form.upperPrice) - parseFloat(form.lowerPrice)) /
@@ -182,21 +223,37 @@ export function GridBotConfig({
 
     const config: GridConfig = {
       pair: form.pair,
-      upperPrice: parseFloat(form.upperPrice),
-      lowerPrice: parseFloat(form.lowerPrice),
-      gridCount: parseInt(form.gridCount),
+      strategyMode: form.strategyMode,
+      upperPrice: parseFloat(form.upperPrice) || 0,
+      lowerPrice: parseFloat(form.lowerPrice) || 0,
+      gridCount: parseInt(form.gridCount) || 2,
       totalInvestment: parseFloat(form.totalInvestment),
       leverage: parseInt(form.leverage) || 1,
+      stopLoss: form.stopLoss ? parseFloat(form.stopLoss) : undefined,
+      takeProfit: form.takeProfit ? parseFloat(form.takeProfit) : undefined,
+      atrMultiplier: parseFloat(form.atrMultiplier),
+      riskPerTrade: parseFloat(form.riskPerTrade),
+      maxDrawdownPct: parseFloat(form.maxDrawdownPct) || 15,
+      enableTrailingStop: form.enableTrailingStop,
+      trailingAtrMult: parseFloat(form.trailingAtrMult) || 2.0,
+      autoReposition: form.autoReposition,
+      trendFilterEnabled: form.trendFilterEnabled,
+      gridType: form.gridType,
+      autoRange: form.autoRange,
     };
 
-    if (config.upperPrice <= config.lowerPrice)
-      return alert("El precio superior debe ser mayor al inferior");
-    if (config.gridCount < 2) return alert("Se necesitan al menos 2 grids");
+    const isGridMode = ["NEUTRAL_GRID", "LONG_GRID", "SHORT_GRID", "AUTO_GRID"].includes(config.strategyMode);
+    if (isGridMode) {
+      if (config.upperPrice <= config.lowerPrice)
+        return alert("El precio superior debe ser mayor al inferior");
+      if (config.gridCount < 2) return alert("Se necesitan al menos 2 grids");
+      if (livePrice && (livePrice < config.lowerPrice || livePrice > config.upperPrice))
+        return alert(
+          `El precio actual ($${livePrice.toFixed(2)}) está fuera del rango [$${config.lowerPrice} – $${config.upperPrice}].`
+        );
+    }
     if (config.totalInvestment <= 0) return alert("La inversión debe ser > 0");
-    if (livePrice && (livePrice < config.lowerPrice || livePrice > config.upperPrice))
-      return alert(
-        `El precio actual ($${livePrice.toFixed(2)}) está fuera del rango [$${config.lowerPrice} – $${config.upperPrice}]. Ajusta el rango para que contenga el precio actual.`
-      );
+
 
     onStart(config);
   };
@@ -302,21 +359,49 @@ export function GridBotConfig({
         </CardContent>
       </Card>
 
-      {/* ── Parámetros de la Grilla ────────────────────────────────────────── */}
+      {/* ── Parámetros de la Estrategia ──────────────────────────────────────── */}
       <Card className="bg-zinc-900 border-zinc-700">
         <CardHeader className="pb-3">
           <CardTitle className="text-sm text-zinc-300">
-            Parámetros de la Grilla
+            Configuración de Estrategia
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-3">
-          <div>
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="text-xs text-zinc-500 mb-1 block">
+                Fase de Mercado
+              </label>
+              <Select
+                value={form.strategyMode}
+                onValueChange={(v) => {
+                  setForm((f) => ({ ...f, strategyMode: v as typeof f.strategyMode }));
+                  setStrategyTip(null);
+                }}
+                disabled={isRunning}
+              >
+                <SelectTrigger className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-zinc-800 border-zinc-700">
+                  <SelectItem value="AUTO_GRID" className="text-blue-400 text-xs font-semibold">Auto Grid (sigue tendencia)</SelectItem>
+                  <SelectItem value="NEUTRAL_GRID" className="text-zinc-200 text-xs">Neutral Grid</SelectItem>
+                  <SelectItem value="LONG_GRID" className="text-emerald-400 text-xs">Long Grid (solo compras)</SelectItem>
+                  <SelectItem value="SHORT_GRID" className="text-red-400 text-xs">Short Grid (solo ventas)</SelectItem>
+                  <SelectItem value="BULL_MOMENTUM" className="text-emerald-400 text-xs font-semibold">Direccional Alcista</SelectItem>
+                  <SelectItem value="BEAR_BREAKDOWN" className="text-red-400 text-xs font-semibold">Direccional Bajista</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
             <label className="text-xs text-zinc-500 mb-1 block">
               Par de Trading
             </label>
             <Select
               value={form.pair}
-              onValueChange={(v) => setForm((f) => ({ ...f, pair: v ?? f.pair, lowerPrice: "", upperPrice: "" }))}
+              onValueChange={(v) => {
+                setForm((f) => ({ ...f, pair: v ?? f.pair, lowerPrice: "", upperPrice: "" }));
+                setStrategyTip(null);
+              }}
               disabled={isRunning}
             >
               <SelectTrigger className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs">
@@ -363,66 +448,166 @@ export function GridBotConfig({
                 Sin fondos en sub-cuenta. Transfiere USDT desde tu cuenta principal en grvt.io
               </p>
             )}
-            {livePrice && (balance === null || balance > 0) && !isRunning && (
-              <div className="space-y-1.5 mt-1">
-                <p className="text-[10px] text-zinc-500 font-medium uppercase tracking-wide">Estrategias sugeridas</p>
-                {([
-                  {
-                    label: "Intraday (±3%) — Max volumen",
-                    desc: "~10 trades/día, 96% cobertura",
-                    lowerPct: 0.97, upperPct: 1.03,
-                    grids: "5", leverage: "20",
-                    highlight: true,
-                  },
-                  {
-                    label: "Scalping (±1.5%) — Rápido",
-                    desc: "Trades frecuentes, rango estrecho",
-                    lowerPct: 0.985, upperPct: 1.015,
-                    grids: "4", leverage: "20",
-                    highlight: false,
-                  },
-                  {
-                    label: "Swing (±5%) — Mayor profit",
-                    desc: "Menos trades, mayor ganancia/ciclo",
-                    lowerPct: 0.95, upperPct: 1.05,
-                    grids: "4", leverage: "10",
-                    highlight: false,
-                  },
-                ] as const).map((s) => (
-                  <button
-                    key={s.label}
-                    type="button"
-                    className={`w-full py-1.5 px-3 rounded border text-left text-xs transition-colors ${
-                      s.highlight
-                        ? "bg-emerald-600/20 border-emerald-500/30 text-emerald-400 hover:bg-emerald-600/30"
-                        : "bg-zinc-800/50 border-zinc-700/50 text-zinc-400 hover:bg-zinc-700/50"
-                    }`}
-                    onClick={() => {
-                      const bal = balance ?? 49.5;
-                      const usable = Math.floor(bal * 0.9 * 100) / 100;
-                      setForm({
-                        pair: form.pair,
-                        lowerPrice: String(Math.floor(livePrice * s.lowerPct)),
-                        upperPrice: String(Math.ceil(livePrice * s.upperPct)),
-                        gridCount: s.grids,
-                        totalInvestment: String(usable),
-                        leverage: s.leverage,
-                      });
-                    }}
-                  >
-                    <span className="font-medium">{s.label}</span>
-                    {s.highlight && <span className="ml-1 text-[9px] text-emerald-500">★ RECOMENDADA</span>}
-                    <br />
-                    <span className="text-[10px] text-zinc-500">
-                      {s.desc} | ${Math.floor(livePrice * s.lowerPct)}-${Math.ceil(livePrice * s.upperPct)}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
+            {livePrice && (balance === null || balance > 0) && !isRunning && (() => {
+              // Modo recomendado según el sesgo detectado
+              const recommendedMode: GridConfig["strategyMode"] =
+                detectedBias === "BULLISH" ? "LONG_GRID" :
+                detectedBias === "BEARISH" ? "SHORT_GRID" :
+                "AUTO_GRID";
+
+              // Presets de rango: [lowerPct, upperPct, slPct, tpPct, grids, leverage]
+              // Para SHORT_GRID invertimos la asimetría del SL/TP
+              const isShort = recommendedMode === "SHORT_GRID";
+              const PRESETS = [
+                {
+                  label: "Intraday (±3%)",
+                  badge: "Max volumen",
+                  desc: "~10 trades/día, 96% cobertura",
+                  lowerPct: 0.97, upperPct: 1.03,
+                  slPct: isShort ? 1.04 : 0.96,
+                  tpPct: isShort ? 0.96 : 1.04,
+                  grids: "5", leverage: "20",
+                  tip: isShort
+                    ? "SHORT Grid Intraday (20x): SL en +4% ($SL_PRICE) para salir si el precio sube fuerte. TP en -4% ($TP_PRICE) para capitalizar la caída."
+                    : "LONG Grid Intraday (20x): SL en -4% ($SL_PRICE) para salir antes de liquidar. TP en +4% ($TP_PRICE) para capitalizar rupturas.",
+                },
+                {
+                  label: "Scalping (±1.5%)",
+                  badge: "Rápido",
+                  desc: "Trades frecuentes, rango estrecho",
+                  lowerPct: 0.985, upperPct: 1.015,
+                  slPct: isShort ? 1.02 : 0.98,
+                  tpPct: isShort ? 0.98 : 1.02,
+                  grids: "4", leverage: "20",
+                  tip: isShort
+                    ? "SHORT Scalping: rango ±1.5%, SL en +2% ($SL_PRICE), TP en -2% ($TP_PRICE). Ideal para caídas rápidas."
+                    : "LONG Scalping: rango ±1.5%, SL en -2% ($SL_PRICE), TP en +2% ($TP_PRICE). Ideal para rebotes cortos.",
+                },
+                {
+                  label: "Swing (±5%)",
+                  badge: "Mayor profit",
+                  desc: "Menos trades, mayor ganancia/ciclo",
+                  lowerPct: 0.95, upperPct: 1.05,
+                  slPct: isShort ? 1.075 : 0.925,
+                  tpPct: isShort ? 0.925 : 1.075,
+                  grids: "4", leverage: "10",
+                  tip: isShort
+                    ? "SHORT Swing (10x): SL amplio en +7.5% ($SL_PRICE), TP en -7.5% ($TP_PRICE) para capturar movimientos bajistas de fondo."
+                    : "LONG Swing (10x): SL al -7.5% ($SL_PRICE), TP en +7.5% ($TP_PRICE) para aguantar alta volatilidad.",
+                },
+              ];
+
+              return (
+                <div className="space-y-1.5 mt-1">
+                  {/* Banner de sesgo detectado */}
+                  {detectedBias && (
+                    <div className={`flex items-center justify-between text-[10px] px-2 py-1 rounded border ${
+                      detectedBias === "BULLISH"
+                        ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+                        : detectedBias === "BEARISH"
+                          ? "bg-red-500/10 border-red-500/20 text-red-400"
+                          : "bg-zinc-700/50 border-zinc-600/50 text-zinc-400"
+                    }`}>
+                      <span>
+                        Mercado detectado: <strong>{detectedBias === "BULLISH" ? "ALCISTA" : detectedBias === "BEARISH" ? "BAJISTA" : "NEUTRAL"}</strong>
+                      </span>
+                      <span className="font-mono font-semibold">
+                        → {recommendedMode.replace(/_/g, " ")}
+                      </span>
+                    </div>
+                  )}
+
+                  <p className="text-[10px] text-zinc-500 font-medium uppercase tracking-wide">
+                    Configuraciones sugeridas
+                  </p>
+
+                  {PRESETS.map((s, i) => {
+                    const isSelected = selectedPresetIdx === i;
+                    const isDefault = i === 0 && selectedPresetIdx === null; // Intraday destacada por defecto
+                    const isBearish = detectedBias === "BEARISH";
+                    const slVal = isShort ? Math.ceil(livePrice * s.slPct) : Math.floor(livePrice * s.slPct);
+                    const tpVal = isShort ? Math.floor(livePrice * s.tpPct) : Math.ceil(livePrice * s.tpPct);
+
+                    // Estilo del botón:
+                    // - Seleccionado: borde sólido + fondo intenso
+                    // - Default (Intraday sin selección): borde tenue + fondo suave
+                    // - No seleccionado: gris neutro
+                    let btnClass: string;
+                    if (isSelected) {
+                      btnClass = isBearish
+                        ? "bg-red-600/30 border-red-400 text-red-200 ring-1 ring-red-400/50"
+                        : "bg-emerald-600/30 border-emerald-400 text-emerald-200 ring-1 ring-emerald-400/50";
+                    } else if (isDefault) {
+                      btnClass = isBearish
+                        ? "bg-red-600/20 border-red-500/40 text-red-300 hover:bg-red-600/30"
+                        : "bg-emerald-600/20 border-emerald-500/40 text-emerald-400 hover:bg-emerald-600/30";
+                    } else {
+                      btnClass = "bg-zinc-800/50 border-zinc-700/50 text-zinc-400 hover:bg-zinc-700/50 hover:border-zinc-600";
+                    }
+
+                    // Badge del modo
+                    let badgeClass: string;
+                    if (isSelected) {
+                      badgeClass = isBearish
+                        ? "border-red-400 text-red-300 bg-red-500/20"
+                        : "border-emerald-400 text-emerald-300 bg-emerald-500/20";
+                    } else if (isDefault) {
+                      badgeClass = isBearish
+                        ? "border-red-500/40 text-red-400 bg-red-500/10"
+                        : "border-emerald-500/40 text-emerald-400 bg-emerald-500/10";
+                    } else {
+                      badgeClass = "border-zinc-600/40 text-zinc-500 bg-zinc-800/30";
+                    }
+
+                    return (
+                      <button
+                        key={s.label}
+                        type="button"
+                        className={`w-full py-1.5 px-3 rounded border text-left text-xs transition-all ${btnClass}`}
+                        onClick={() => {
+                          setSelectedPresetIdx(i);
+                          setForm((f) => ({
+                            ...f,
+                            strategyMode: recommendedMode,
+                            lowerPrice: String(Math.floor(livePrice * s.lowerPct)),
+                            upperPrice: String(Math.ceil(livePrice * s.upperPct)),
+                            gridCount: s.grids,
+                            leverage: s.leverage,
+                            stopLoss: String(slVal),
+                            takeProfit: String(tpVal),
+                          }));
+                          setStrategyTip(
+                            s.tip
+                              .replace("$SL_PRICE", slVal.toString())
+                              .replace("$TP_PRICE", tpVal.toString())
+                          );
+                        }}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold">{s.label}</span>
+                          <span className={`text-[9px] px-1.5 py-0.5 rounded border font-mono ${badgeClass}`}>
+                            {recommendedMode.replace(/_/g, " ")}
+                            {(isSelected || isDefault) && " ★"}
+                          </span>
+                        </div>
+                        <span className={`text-[10px] ${isSelected ? (isBearish ? "text-red-400/80" : "text-emerald-400/80") : "text-zinc-500"}`}>
+                          {s.badge} · {s.desc}
+                        </span>
+                        <br />
+                        <span className={`text-[10px] ${isSelected ? "text-zinc-400" : "text-zinc-600"}`}>
+                          ${Math.floor(livePrice * s.lowerPct).toLocaleString()}–${Math.ceil(livePrice * s.upperPct).toLocaleString()} · {s.grids} grids · {s.leverage}x
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              );
+            })()}
           </div>
 
-          <div className="grid grid-cols-2 gap-2">
+          {["NEUTRAL_GRID", "LONG_GRID", "SHORT_GRID", "AUTO_GRID"].includes(form.strategyMode) && (
+            <>
+              <div className="grid grid-cols-2 gap-2">
             <div>
               <label className="text-xs text-zinc-500 mb-1 block">
                 Precio Inferior ($)
@@ -451,6 +636,41 @@ export function GridBotConfig({
             </div>
           </div>
 
+          <div className="grid grid-cols-2 gap-2 mt-2">
+            <div>
+              <label className="text-xs text-zinc-500 mb-1 block">
+                Stop Loss ($) <span className="text-zinc-700">(opcional)</span>
+              </label>
+              <Input
+                type="number"
+                value={form.stopLoss}
+                onChange={set("stopLoss")}
+                placeholder="0.00"
+                className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
+                disabled={isRunning}
+              />
+            </div>
+            <div>
+              <label className="text-xs text-zinc-500 mb-1 block">
+                Take Profit ($) <span className="text-zinc-700">(opcional)</span>
+              </label>
+              <Input
+                type="number"
+                value={form.takeProfit}
+                onChange={set("takeProfit")}
+                placeholder="0.00"
+                className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
+                disabled={isRunning}
+              />
+            </div>
+          </div>
+          {strategyTip && (
+            <div className="mt-2 text-[10px] text-zinc-400 bg-zinc-800/50 p-2 rounded border border-zinc-700/50">
+              <span className="text-emerald-400 font-semibold mr-1">Tesis:</span>
+              {strategyTip}
+            </div>
+          )}
+
           {/* Range validation warning */}
           {livePrice && parseFloat(form.lowerPrice) > 0 && parseFloat(form.upperPrice) > 0 && (
             livePrice < parseFloat(form.lowerPrice) || livePrice > parseFloat(form.upperPrice)
@@ -477,21 +697,55 @@ export function GridBotConfig({
             </Alert>
           )}
 
-          <div className="grid grid-cols-3 gap-2">
-            <div>
-              <label className="text-xs text-zinc-500 mb-1 block">
-                N° de Grids
-              </label>
-              <Input
-                type="number"
-                min="2"
-                max="100"
-                value={form.gridCount}
-                onChange={set("gridCount")}
-                className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
-                disabled={isRunning}
-              />
+              <div className="grid grid-cols-3 gap-2 mt-2">
+                <div>
+                  <label className="text-xs text-zinc-500 mb-1 block">
+                    N° de Grids
+                  </label>
+                  <Input
+                    type="number"
+                    min="2"
+                    max="100"
+                    value={form.gridCount}
+                    onChange={set("gridCount")}
+                    className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
+                    disabled={isRunning}
+                  />
+                </div>
+              </div>
+            </>
+          )}
+
+          {form.strategyMode !== "NEUTRAL_GRID" && (
+            <div className="grid grid-cols-2 gap-2 mt-2">
+              <div>
+                <label className="text-xs text-zinc-500 mb-1 block">
+                  Riesgo por Trade (%)
+                </label>
+                <Input
+                  type="number"
+                  value={form.riskPerTrade}
+                  onChange={set("riskPerTrade")}
+                  className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
+                  disabled={isRunning}
+                />
+              </div>
+              <div>
+                <label className="text-xs text-zinc-500 mb-1 block">
+                  Multiplicador ATR
+                </label>
+                <Input
+                  type="number"
+                  value={form.atrMultiplier}
+                  onChange={set("atrMultiplier")}
+                  className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
+                  disabled={isRunning}
+                />
+              </div>
             </div>
+          )}
+
+          <div className="grid grid-cols-2 gap-2">
             <div>
               <label className="text-xs text-zinc-500 mb-1 block">
                 Inversión (USDC)
@@ -527,8 +781,73 @@ export function GridBotConfig({
             </div>
           </div>
 
-          {/* Preview de la grilla */}
-          {!isNaN(gridStep) && gridStep > 0 && (() => {
+          {/* Controles de Protección */}
+          <Card className="bg-zinc-800/50 border-zinc-700/50">
+            <CardContent className="pt-3 pb-3 space-y-2">
+              <p className="text-[10px] text-zinc-500 font-medium uppercase tracking-wide">Protecciones</p>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="text-xs text-zinc-500 mb-1 block">
+                    Max Drawdown (%)
+                  </label>
+                  <Input
+                    type="number"
+                    value={form.maxDrawdownPct}
+                    onChange={set("maxDrawdownPct")}
+                    className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
+                    disabled={isRunning}
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-zinc-500 mb-1 block">
+                    Trailing ATR Mult
+                  </label>
+                  <Input
+                    type="number"
+                    value={form.trailingAtrMult}
+                    onChange={set("trailingAtrMult")}
+                    className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
+                    disabled={isRunning}
+                  />
+                </div>
+              </div>
+              <div className="flex gap-4 text-xs">
+                <label className="flex items-center gap-1.5 text-zinc-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.enableTrailingStop}
+                    onChange={(e) => setForm((f) => ({ ...f, enableTrailingStop: e.target.checked }))}
+                    disabled={isRunning}
+                    className="rounded border-zinc-600"
+                  />
+                  Trailing Stop
+                </label>
+                <label className="flex items-center gap-1.5 text-zinc-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.autoReposition}
+                    onChange={(e) => setForm((f) => ({ ...f, autoReposition: e.target.checked }))}
+                    disabled={isRunning}
+                    className="rounded border-zinc-600"
+                  />
+                  Auto-Reposicionar
+                </label>
+                <label className="flex items-center gap-1.5 text-zinc-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={form.trendFilterEnabled}
+                    onChange={(e) => setForm((f) => ({ ...f, trendFilterEnabled: e.target.checked }))}
+                    disabled={isRunning}
+                    className="rounded border-zinc-600"
+                  />
+                  Filtro Tendencia
+                </label>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* Preview de la estrategia */}
+          {["NEUTRAL_GRID", "LONG_GRID", "SHORT_GRID", "AUTO_GRID"].includes(form.strategyMode) && !isNaN(gridStep) && gridStep > 0 && (() => {
             const lev = parseInt(form.leverage) || 1;
             const inv = parseFloat(form.totalInvestment) || 0;
             const grids = parseInt(form.gridCount) || 2;

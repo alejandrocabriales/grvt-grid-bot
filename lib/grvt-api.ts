@@ -293,6 +293,47 @@ export async function getOpenOrders(
   return data.result || [];
 }
 
+// ─── Positions ────────────────────────────────────────────────────────────────
+
+export interface Position {
+  instrument: string;
+  size: string;           // positive = long, negative = short
+  entry_price: string;
+  mark_price: string;
+  unrealized_pnl: string;
+  realized_pnl: string;
+  margin: string;
+  leverage: string;
+}
+
+export async function getPositions(
+  session: GrvtSession,
+  subAccountId: string,
+  instrument?: string
+): Promise<Position[]> {
+  const body: Record<string, unknown> = { sub_account_id: subAccountId };
+  if (instrument) body.instrument = instrument;
+
+  const res = await fetch(`${getBaseUrls().rest}/full/v1/positions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: session.cookie,
+      "X-Grvt-Account-Id": session.accountId,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    console.error(`[Positions] Failed (${res.status}):`, text);
+    return [];
+  }
+
+  const data = await res.json();
+  return data.result || [];
+}
+
 // ─── Leverage ─────────────────────────────────────────────────────────────────
 
 export async function setInitialLeverage(
@@ -372,3 +413,45 @@ export async function getSubAccountSummary(
     raw: result,
   };
 }
+
+// ─── K-lines (Fallback via Binance) ──────────────────────────────────────────
+
+export interface Kline {
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export async function getBinanceKlines(
+  symbol: string,
+  interval: string = "5m",
+  limit: number = 200
+): Promise<Kline[]> {
+  try {
+    // Convert GRVT symbol (ETH_USDT_Perp) to Binance (ETHUSDT)
+    const binanceSymbol = symbol.split("_")[0] + "USDT";
+    const res = await fetch(
+      `https://api.binance.com/api/v3/klines?symbol=${binanceSymbol}&interval=${interval}&limit=${limit}`
+    );
+    if (!res.ok) {
+      console.error(`[Klines] Failed to fetch from binance: ${res.statusText}`);
+      return [];
+    }
+    const data = await res.json();
+    return data.map((k: any) => ({
+      timestamp: k[0],
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }));
+  } catch (err) {
+    console.error("[Klines] Error fetching from binance:", err);
+    return [];
+  }
+}
+

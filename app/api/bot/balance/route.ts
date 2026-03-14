@@ -25,6 +25,7 @@ export async function GET() {
       availableBalance: summary.availableBalance,
       pnl: summary.pnl,
       subAccountId,
+      maintenanceMargin: String(summary.raw?.maintenance_margin ?? "0"),
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
