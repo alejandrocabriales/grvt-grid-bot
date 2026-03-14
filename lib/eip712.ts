@@ -53,6 +53,7 @@ export interface SignedOrderParams {
   limitPrice: string; // in quote units (e.g., USDC price)
   isBuying: boolean;
   isMarket?: boolean;
+  reduceOnly?: boolean;
   privateKey: string;
   useTestnet?: boolean;
 }
@@ -105,6 +106,7 @@ export async function signLimitOrder(
     limitPrice,
     isBuying,
     isMarket = false,
+    reduceOnly = false,
     privateKey,
     useTestnet = false,
   } = params;
@@ -126,7 +128,7 @@ export async function signLimitOrder(
     isMarket,
     timeInForce: TIME_IN_FORCE.GOOD_TILL_TIME,
     postOnly: false,
-    reduceOnly: false,
+    reduceOnly: reduceOnly ?? false,
     legs: [
       {
         assetID: BigInt(instrumentId),
@@ -148,7 +150,7 @@ export async function signLimitOrder(
     is_market: isMarket,
     time_in_force: "GOOD_TILL_TIME",
     post_only: false,
-    reduce_only: false,
+    reduce_only: reduceOnly ?? false,
     legs: [
       {
         instrument,
