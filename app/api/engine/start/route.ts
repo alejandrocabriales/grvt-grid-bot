@@ -17,9 +17,10 @@ export async function POST(req: NextRequest) {
     }
 
     // Guardar config en disco para que run-bot.ts la cargue
+    // Usar /tmp como fallback ya que process.cwd() puede ser read-only en entornos serverless
     const dbDir = process.env.BOT_DB_PATH
       ? path.dirname(process.env.BOT_DB_PATH)
-      : process.cwd();
+      : (process.env.TMPDIR ?? "/tmp");
     const configPath = path.join(dbDir, "bot-config.json");
     fs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf8");
 
