@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { startEngine, isEngineRunning } from "@/lib/server/engine-process";
+import { proxyEngine } from "@/lib/server/engine-proxy";
 import type { GridConfig } from "@/lib/grid-bot";
 import fs from "fs";
 import path from "path";
@@ -8,6 +9,10 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const config: GridConfig = body.config;
+
+    // Si ENGINE_BASE_URL está definido, proxiar a Fly.io
+    const proxied = await proxyEngine("start", "POST", { config });
+    if (proxied !== null) return NextResponse.json(proxied);
     if (!config) {
       return NextResponse.json({ ok: false, error: "Missing config" }, { status: 400 });
     }

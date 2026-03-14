@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { BotDatabase } from "@/scripts/db";
 import { isEngineRunning } from "@/lib/server/engine-process";
+import { proxyEngine } from "@/lib/server/engine-proxy";
 import type { GridConfig } from "@/lib/grid-bot";
 import path from "path";
 
@@ -11,6 +12,8 @@ function openDb(): BotDatabase {
 
 export async function GET() {
   try {
+    const proxied = await proxyEngine("status", "GET");
+    if (proxied !== null) return NextResponse.json(proxied);
     const db = openDb();
 
     const botStatus        = db.getConfig<string>("bot_status");
