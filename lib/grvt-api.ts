@@ -159,7 +159,6 @@ export async function loginWithApiKey(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ api_key: apiKey }),
-    credentials: "include",
   });
 
   if (!res.ok) {
@@ -170,7 +169,13 @@ export async function loginWithApiKey(
   const data = await res.json();
 
   // Extract cookie from response headers or body
-  const setCookie = res.headers.get("set-cookie") || "";
+  // Node.js fetch: getSetCookie() returns array; fallback to get() for older runtimes
+  const cookies: string[] =
+    typeof (res.headers as any).getSetCookie === "function"
+      ? (res.headers as any).getSetCookie()
+      : [res.headers.get("set-cookie") || ""];
+
+  const setCookie = cookies.join("; ");
   const cookieMatch = setCookie.match(/gravity=([^;]+)/);
   const cookie = cookieMatch ? `gravity=${cookieMatch[1]}` : data.cookie || "";
 
