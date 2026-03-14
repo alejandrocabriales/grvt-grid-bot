@@ -180,6 +180,20 @@ export class BotDatabase {
       .run(level, message, Date.now());
   }
 
+  // ─── Read helpers for UI ──────────────────────────────────────────────────
+
+  getLogsRecent(limit = 50): { level: string; message: string; timestamp: number }[] {
+    return this.db
+      .prepare(`SELECT level, message, timestamp FROM bot_log ORDER BY id DESC LIMIT ?`)
+      .all(limit) as { level: string; message: string; timestamp: number }[];
+  }
+
+  getOrderHistory(pair: string, limit = 100): DbOrder[] {
+    return this.db
+      .prepare(`SELECT * FROM grid_orders WHERE pair = ? ORDER BY id DESC LIMIT ?`)
+      .all(pair, limit) as DbOrder[];
+  }
+
   close(): void {
     this.db.close();
   }

@@ -12,6 +12,7 @@ COPY package*.json ./
 RUN npm ci
 
 COPY . .
+RUN npm run build
 
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM node:20-slim
@@ -22,9 +23,13 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copiar dependencias compiladas y fuentes
+# Copiar artefactos de build
 COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app .
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/scripts ./scripts
+COPY --from=builder /app/lib ./lib
+COPY --from=builder /app/package.json ./package.json
 
 # Directorio para el volumen persistente (SQLite)
 RUN mkdir -p /data
@@ -32,4 +37,5 @@ RUN mkdir -p /data
 ENV BOT_DB_PATH=/data/bot-state.sqlite
 ENV NODE_ENV=production
 
-CMD ["npx", "tsx", "scripts/run-bot.ts"]
+EXPOSE 3000
+CMD ["npm", "start"]
