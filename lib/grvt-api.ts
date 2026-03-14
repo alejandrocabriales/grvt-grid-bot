@@ -168,23 +168,54 @@ export async function loginWithApiKey(
 
   const data = await res.json();
 
+  // Log all response headers for debugging
+  const allHeaders: Record<string, string> = {};
+  res.headers.forEach((value, key) => { allHeaders[key] = value; });
+  console.log("[GRVT Auth] Response headers:", JSON.stringify(allHeaders, null, 2));
+  console.log("[GRVT Auth] Response body:", JSON.stringify(data, null, 2));
+
   // Extract cookie from response headers or body
   // Node.js fetch: getSetCookie() returns array; fallback to get() for older runtimes
-  const cookies: string[] =
+  const setCookieHeaders: string[] =
     typeof (res.headers as any).getSetCookie === "function"
       ? (res.headers as any).getSetCookie()
-      : [res.headers.get("set-cookie") || ""];
+      : [];
 
-  const setCookie = cookies.join("; ");
-  const cookieMatch = setCookie.match(/gravity=([^;]+)/);
-  const cookie = cookieMatch ? `gravity=${cookieMatch[1]}` : data.cookie || "";
+  // Also try the legacy single-header approach
+  const singleCookie = res.headers.get("set-cookie") || "";
+  const allCookieStr = [...setCookieHeaders, singleCookie].filter(Boolean).join("; ");
+
+  console.log("[GRVT Auth] All set-cookie values:", setCookieHeaders);
+  console.log("[GRVT Auth] Single set-cookie header:", singleCookie);
+
+  // Try to find the gravity= cookie in headers
+  const cookieMatch = allCookieStr.match(/gravity=([^;,\s]+)/);
+  let cookie = cookieMatch ? `gravity=${cookieMatch[1]}` : "";
+
+  // Fallback: check response body for token fields
+  if (!cookie) {
+    cookie =
+      data.cookie ||
+      data.token ||
+      data.access_token ||
+      data.session_token ||
+      (data.result?.cookie) ||
+      (data.result?.token) ||
+      "";
+    if (cookie && !cookie.startsWith("gravity=")) {
+      cookie = `gravity=${cookie}`;
+    }
+  }
 
   const accountId =
-    res.headers.get("x-grvt-account-id") || data.account_id || "";
+    res.headers.get("x-grvt-account-id") ||
+    data.account_id ||
+    data.result?.account_id ||
+    "";
 
   if (!cookie) {
-    console.error("[GRVT Auth] No cookie captured. set-cookie header:", setCookie);
-    console.error("[GRVT Auth] Response body keys:", Object.keys(data));
+    console.error("[GRVT Auth] No cookie captured anywhere. All cookie strings:", allCookieStr);
+    console.error("[GRVT Auth] Full body:", JSON.stringify(data));
     throw new Error(
       "GRVT login succeeded but no session cookie was captured. " +
       "Check that the API key is valid and the set-cookie header is accessible."
