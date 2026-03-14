@@ -20,7 +20,7 @@ export function startEngine(configPath: string): { pid: number } {
 
   const proc = spawn(
     "npx",
-    ["tsx", path.join(process.cwd(), "scripts/run-bot.ts"), "--config", configPath],
+    ["tsx", path.join(process.cwd(), "scripts/run-bot.ts"), "--config", configPath, "--reset"],
     {
       cwd: process.cwd(),
       env: process.env,
