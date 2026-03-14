@@ -1,0 +1,17 @@
+{
+  "pair":               "ETH_USDT_Perp",
+  "strategyMode":       "NEUTRAL_GRID",
+  "upperPrice":         3500,
+  "lowerPrice":         2800,
+  "gridCount":          14,
+  "gridType":           "GEOMETRIC",
+  "totalInvestment":    200,
+  "leverage":           2,
+  "stopLoss":           2600,
+  "takeProfit":         4200,
+  "maxDrawdownPct":     15,
+  "enableTrailingStop": false,
+  "trailingAtrMult":    2.0,
+  "autoReposition":     false,
+  "trendFilterEnabled": true
+}
