@@ -32,6 +32,7 @@ const SUPPORTED_PAIRS = [
   "SOL_USDT_Perp",
   "ARB_USDT_Perp",
   "OP_USDT_Perp",
+  "XRP_USDT_Perp",
 ];
 
 // ─── Tipos para el estado de credenciales ────────────────────────────────────

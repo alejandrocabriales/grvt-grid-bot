@@ -1,0 +1,18 @@
+{
+  "pair": "BTC_USDT_Perp",
+  "totalInvestment": 50,
+  "leverage": 10,
+  "spreadPairs": 3,
+  "spreadOffsetBps": 2,
+  "spreadStepBps": 3,
+  "orderStalenessMs": 30000,
+  "scalpTpBps": 8,
+  "scalpSlBps": 5,
+  "maxScalpPositions": 1,
+  "maxDrawdownPct": 3,
+  "maxSessionLossUsdc": 2.5,
+  "maxVolatilityRatio": 0.04,
+  "maxExposurePct": 50,
+  "gridRecenterIntervalMs": 60000,
+  "gridAtrMult": 0.3
+}
