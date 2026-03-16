@@ -18,6 +18,7 @@ import {
   loginWithApiKey,
   getOpenOrders,
   createOrder,
+  cancelOrder,
   cancelAllOrders as grvtCancelAll,
   getPositions,
   getSubAccountSummary,
@@ -30,6 +31,8 @@ import { signLimitOrder } from "../lib/eip712";
 
 import {
   calculateGridLevels,
+  calculateAutoRange,
+  calculateAtrGridCount,
   getInitialOrders,
   getCounterOrder,
   calculateMaxGrids,
@@ -158,6 +161,12 @@ export class GridEngine {
   private peakPrice: number | null         = null;
   private troughPrice: number | null       = null;
   private maxEquity                        = 0;
+
+  // Módulos dinámicos avanzados
+  private macro4hEma200: number | null     = null;  // EMA200 en 4H para filtro macro
+  private dailyRsi: number | null          = null;  // RSI(14) diario
+  private marginGuardActive                = false; // pausa compras si margin > umbral
+  private macroExitApplied                 = false; // salida parcial aplicada (no repetir)
 
   // Stats
   private totalPnL     = 0;
@@ -295,6 +304,31 @@ export class GridEngine {
 
     // Indicadores (primer cálculo)
     await this.refreshIndicators();
+
+    // Módulo 2: calcular rango y gridCount dinámicamente desde ATR si autoRange=true
+    if (this.config.autoRange && this.indicators?.atr50 && this.indicators?.atr14) {
+      const direction = getGridDirection(this.config.strategyMode, this.marketBias);
+      const { lowerPrice, upperPrice } = calculateAutoRange(
+        this.currentPrice,
+        this.indicators.atr50,
+        this.config.atrMultiplier ?? 2.0,
+        direction
+      );
+      const totalRange = upperPrice - lowerPrice;
+      const atrGridCount = calculateAtrGridCount(
+        totalRange,
+        this.indicators.atr14,
+        this.config.atrStepMult ?? 0.5
+      );
+      this.config.lowerPrice = lowerPrice;
+      this.config.upperPrice = upperPrice;
+      this.config.gridCount  = atrGridCount;
+      log(
+        this.db,
+        "info",
+        `[ATR Grid] Rango: $${lowerPrice.toFixed(this.priceDecimals)}–$${upperPrice.toFixed(this.priceDecimals)} | Step: ATR14*${this.config.atrStepMult ?? 0.5} = $${(this.indicators.atr14 * (this.config.atrStepMult ?? 0.5)).toFixed(this.priceDecimals)} | Niveles: ${atrGridCount}`
+      );
+    }
 
     // Auto-reducir grids si el tamaño de orden quedaría por debajo de min_size
     const safeGridCount = calculateMaxGrids(
@@ -469,6 +503,23 @@ export class GridEngine {
       return;
     }
 
+    // Módulo 3: si el margin guard está activo, bloquear nuevas compras
+    if (this.marginGuardActive && counter.type === "buy") {
+      log(this.db, "warn", `[MarginGuard] Contra-orden BUY @ $${counter.price} bloqueada (margin guard activo)`);
+      return;
+    }
+
+    // Módulo 1: si el precio está debajo de la EMA200 4H, bloquear nuevas compras en modo LONG
+    if (
+      this.macro4hEma200 !== null &&
+      this.currentPrice < this.macro4hEma200 &&
+      counter.type === "buy" &&
+      this.config.strategyMode === "LONG_GRID"
+    ) {
+      log(this.db, "warn", `[4H Filter] Precio $${this.currentPrice} < EMA200-4H $${this.macro4hEma200.toFixed(this.priceDecimals)} → BUY bloqueada`);
+      return;
+    }
+
     // P&L por ciclo (solo cuando se completa buy→sell)
     if (filledOrder.side === "buy") {
       const cyclePnl = (counter.price - filledOrder.price) * parseFloat(counter.size);
@@ -513,9 +564,11 @@ export class GridEngine {
 
   private async refreshIndicators(): Promise<void> {
     try {
-      const [klines1h, klines5m] = await Promise.all([
-        getBinanceKlines(this.config.pair, "1h", 250),
-        getBinanceKlines(this.config.pair, "5m",  10),
+      const [klines1h, klines5m, klines4h, klinesDaily] = await Promise.all([
+        getBinanceKlines(this.config.pair, "1h",  250),
+        getBinanceKlines(this.config.pair, "5m",   10),
+        getBinanceKlines(this.config.pair, "4h",  220), // Módulo 1: filtro macro 4H
+        getBinanceKlines(this.config.pair, "1d",   30), // Módulo 4: RSI diario
       ]);
 
       if (klines1h.length >= 50) {
@@ -526,6 +579,27 @@ export class GridEngine {
           "info",
           `[Ind] Bias: ${this.marketBias} | Score: ${this.indicators.marketScore} | Fase: ${this.indicators.marketPhase} | Freefall: ${this.indicators.isFreefalling}`
         );
+      }
+
+      // Módulo 1: EMA200 en 4H (filtro macro más preciso)
+      if (klines4h.length >= 200) {
+        const ind4h = calculateIndicators(klines4h);
+        this.macro4hEma200 = ind4h.ema200;
+        if (ind4h.ema200) {
+          const bias4h = this.currentPrice > 0
+            ? (this.currentPrice > ind4h.ema200 ? "encima" : "debajo")
+            : "desconocido";
+          log(this.db, "info", `[4H] EMA200: $${ind4h.ema200.toFixed(this.priceDecimals)} | Precio ${bias4h} de EMA200`);
+        }
+      }
+
+      // Módulo 4: RSI diario para macro exit
+      if (klinesDaily.length >= 20) {
+        const indDaily = calculateIndicators(klinesDaily);
+        this.dailyRsi = indDaily.rsi.at(-1) ?? null;
+        if (this.dailyRsi !== null) {
+          log(this.db, "info", `[Daily] RSI(14): ${this.dailyRsi.toFixed(1)}`);
+        }
       }
 
       if (klines5m.length > 0) {
@@ -608,6 +682,20 @@ export class GridEngine {
         return;
       }
 
+      // Módulo 3: Margin ratio guard (pausa compras sin detener el bot)
+      const availBal   = parseFloat(balance.availableBalance);
+      const marginUsed = equity - availBal;
+      const marginRatio = equity > 0 ? (marginUsed / equity) * 100 : 0;
+      const guardThreshold = this.config.marginGuardPct ?? 15;
+      if (marginRatio > guardThreshold && !this.marginGuardActive) {
+        this.marginGuardActive = true;
+        log(this.db, "warn", `[MarginGuard] Margin usado: ${marginRatio.toFixed(1)}% > ${guardThreshold}% → pausando nuevas compras`);
+      } else if (marginRatio < guardThreshold * 0.85 && this.marginGuardActive) {
+        // Reactivar con histeresis del 15% para evitar flapping
+        this.marginGuardActive = false;
+        log(this.db, "info", `[MarginGuard] Margin recuperado: ${marginRatio.toFixed(1)}% → reanudando compras`);
+      }
+
       // ── Stop-Loss / Take-Profit estáticos ──────────────────────────────────
       if (this.currentPrice > 0) {
         if (this.config.stopLoss && this.currentPrice <= this.config.stopLoss) {
@@ -680,8 +768,84 @@ export class GridEngine {
 
     await this.refreshIndicators();
 
+    // Módulo 4: Salida macro en sobrecompra diaria extrema
+    if (this.config.macroRsiExit && this.dailyRsi !== null) {
+      if (this.dailyRsi > 80 && !this.macroExitApplied) {
+        await this.partialExit(`RSI diario = ${this.dailyRsi.toFixed(1)} > 80`);
+      } else if (this.dailyRsi < 65 && this.macroExitApplied) {
+        // Resetear cuando el RSI se enfría → listo para operar de nuevo
+        this.macroExitApplied = false;
+        log(this.db, "info", `[MacroExit] RSI diario < 65 (${this.dailyRsi.toFixed(1)}) → reset, grid completo activo`);
+      }
+    }
+
     if (this.running) {
       setTimeout(() => this.indicatorsPollingLoop(), INDICATORS_POLL_MS);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  MÓDULO 4: SALIDA PARCIAL + BREAK-EVEN SL
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Cancela el 50% más barato de las órdenes de compra abiertas y mueve el SL
+   * al precio de entrada promedio (break-even).
+   *
+   * Se activa cuando el RSI diario supera 80 (sobrecompra extrema).
+   * Solo se aplica una vez por ciclo de mercado; se resetea si el RSI cae < 65.
+   */
+  private async partialExit(reason: string): Promise<void> {
+    if (this.macroExitApplied) return;
+    this.macroExitApplied = true;
+
+    log(this.db, "warn", `[MacroExit] ${reason} → Iniciando salida parcial del 50% de la grilla`);
+
+    const session      = await this.ensureSession();
+    const subAccountId = process.env.GRVT_SUB_ACCOUNT_ID!;
+
+    // Cancelar el 50% inferior de las órdenes de compra (las más alejadas del precio actual)
+    const dbOpen    = this.db.getOpenOrders(this.config.pair);
+    const buyOrders = dbOpen
+      .filter((o) => o.side === "buy" && o.order_id)
+      .sort((a, b) => a.price - b.price); // más baratas primero
+
+    const cancelCount = Math.ceil(buyOrders.length / 2);
+    const toCancel    = buyOrders.slice(0, cancelCount);
+
+    log(this.db, "warn", `[MacroExit] Cancelando ${cancelCount} de ${buyOrders.length} órdenes BUY`);
+
+    for (const order of toCancel) {
+      try {
+        await cancelOrder(session, subAccountId, order.order_id!);
+        this.db.updateOrderStatus(order.order_id!, "cancelled", Date.now());
+        log(this.db, "info", `[MacroExit] BUY cancelada @ $${order.price}`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(this.db, "warn", `[MacroExit] Error cancelando BUY @ $${order.price}: ${msg}`);
+      }
+      await sleep(200);
+    }
+
+    // Calcular precio de entrada promedio desde la posición (break-even)
+    try {
+      const positions = await getPositions(session, subAccountId, this.config.pair);
+      const pos       = positions.find((p) => p.instrument === this.config.pair);
+      if (pos && parseFloat(pos.size) > 0) {
+        const markPrice  = parseFloat(pos.mark_price);
+        const upnl       = parseFloat(pos.unrealized_pnl);
+        const size       = parseFloat(pos.size);
+        const entryPrice = size > 0 ? markPrice - upnl / size : markPrice;
+        this.config.stopLoss = entryPrice;
+        log(
+          this.db,
+          "warn",
+          `[MacroExit] SL movido a break-even: $${entryPrice.toFixed(this.priceDecimals)} (entrada promedio)`
+        );
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log(this.db, "warn", `[MacroExit] No se pudo calcular break-even: ${msg}`);
     }
   }
 
