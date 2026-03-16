@@ -92,6 +92,10 @@ export function GridBotConfig({
     trendFilterEnabled: true,
     gridType: "GEOMETRIC" as GridConfig["gridType"],
     autoRange: false,
+    // ─── Módulos dinámicos avanzados ───────────────────────────────────────
+    atrStepMult: "0.5",
+    marginGuardPct: "15",
+    macroRsiExit: false,
   });
 
   // Live price for the selected pair
@@ -240,6 +244,9 @@ export function GridBotConfig({
       trendFilterEnabled: form.trendFilterEnabled,
       gridType: form.gridType,
       autoRange: form.autoRange,
+      atrStepMult: parseFloat(form.atrStepMult) || 0.5,
+      marginGuardPct: parseFloat(form.marginGuardPct) || 15,
+      macroRsiExit: form.macroRsiExit,
     };
 
     const isGridMode = ["NEUTRAL_GRID", "LONG_GRID", "SHORT_GRID", "AUTO_GRID"].includes(config.strategyMode);
@@ -516,6 +523,48 @@ export function GridBotConfig({
                       </span>
                     </div>
                   )}
+
+                  {/* Preset especial: Dynamic Grid */}
+                  <button
+                    type="button"
+                    className={`w-full py-2 px-3 rounded border text-left text-xs transition-all ${
+                      form.autoRange && form.macroRsiExit
+                        ? "bg-violet-600/30 border-violet-400 text-violet-200 ring-1 ring-violet-400/50"
+                        : "bg-violet-500/10 border-violet-500/30 text-violet-300 hover:bg-violet-500/20"
+                    }`}
+                    onClick={() => {
+                      setSelectedPresetIdx(null);
+                      setForm((f) => ({
+                        ...f,
+                        strategyMode: "AUTO_GRID",
+                        autoRange: true,
+                        atrStepMult: "0.5",
+                        marginGuardPct: "15",
+                        macroRsiExit: true,
+                        enableTrailingStop: true,
+                        trendFilterEnabled: true,
+                        autoReposition: true,
+                        leverage: "20",
+                        stopLoss: "",
+                        takeProfit: "",
+                      }));
+                      setStrategyTip("Dynamic Grid: rango y grids se calculan automáticamente desde el ATR. El filtro 4H bloquea compras en tendencia bajista. La grilla se reduce al 50% si el RSI diario supera 80.");
+                    }}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold">Dynamic Grid (ATR)</span>
+                      <span className="text-[9px] px-1.5 py-0.5 rounded border border-violet-400/50 text-violet-300 bg-violet-500/10 font-mono">
+                        AUTO_GRID ✦
+                      </span>
+                    </div>
+                    <span className="text-[10px] text-violet-400/80">
+                      Espaciado ATR·0.5 · Filtro 4H EMA200 · Salida RSI diario &gt;80
+                    </span>
+                    <br />
+                    <span className="text-[10px] text-violet-500/70">
+                      Rango automático · Margin guard 15% · Trailing stop activo
+                    </span>
+                  </button>
 
                   <p className="text-[10px] text-zinc-500 font-medium uppercase tracking-wide">
                     Configuraciones sugeridas
@@ -811,7 +860,7 @@ export function GridBotConfig({
                   />
                 </div>
               </div>
-              <div className="flex gap-4 text-xs">
+              <div className="flex gap-4 text-xs flex-wrap">
                 <label className="flex items-center gap-1.5 text-zinc-400 cursor-pointer">
                   <input
                     type="checkbox"
@@ -842,6 +891,83 @@ export function GridBotConfig({
                   />
                   Filtro Tendencia
                 </label>
+              </div>
+
+              {/* ── Módulos Dinámicos Avanzados ────────────────────────────── */}
+              <div className="pt-1 border-t border-zinc-700/50">
+                <p className="text-[10px] text-zinc-500 font-medium uppercase tracking-wide mb-2">
+                  Módulos Dinámicos
+                </p>
+                <div className="flex gap-4 text-xs flex-wrap mb-2">
+                  <label className="flex items-center gap-1.5 text-zinc-400 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={form.autoRange}
+                      onChange={(e) => setForm((f) => ({ ...f, autoRange: e.target.checked }))}
+                      disabled={isRunning}
+                      className="rounded border-zinc-600"
+                    />
+                    <span>
+                      Rango Auto-ATR{" "}
+                      <span className="text-zinc-600 text-[10px]">(calcula grids desde ATR)</span>
+                    </span>
+                  </label>
+                  <label className="flex items-center gap-1.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={form.macroRsiExit}
+                      onChange={(e) => setForm((f) => ({ ...f, macroRsiExit: e.target.checked }))}
+                      disabled={isRunning}
+                      className="rounded border-zinc-600"
+                    />
+                    <span className={form.macroRsiExit ? "text-violet-400" : "text-zinc-400"}>
+                      Salida Macro RSI&gt;80{" "}
+                      <span className="text-zinc-600 text-[10px]">(cierra 50% + break-even)</span>
+                    </span>
+                  </label>
+                </div>
+                {form.autoRange && (
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-xs text-zinc-500 mb-1 block">
+                        ATR Step Mult{" "}
+                        <span className="text-zinc-700">(espaciado entre niveles)</span>
+                      </label>
+                      <Input
+                        type="number"
+                        step="0.1"
+                        min="0.1"
+                        max="2"
+                        value={form.atrStepMult}
+                        onChange={set("atrStepMult")}
+                        className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
+                        disabled={isRunning}
+                      />
+                      <p className="text-[10px] text-zinc-600 mt-0.5">
+                        dist. = ATR14 × {form.atrStepMult || "0.5"}
+                      </p>
+                    </div>
+                    <div>
+                      <label className="text-xs text-zinc-500 mb-1 block">
+                        Margin Guard (%){" "}
+                        <span className="text-zinc-700">(pausa compras)</span>
+                      </label>
+                      <Input
+                        type="number"
+                        step="1"
+                        min="5"
+                        max="50"
+                        value={form.marginGuardPct}
+                        onChange={set("marginGuardPct")}
+                        className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
+                        disabled={isRunning}
+                      />
+                      <p className="text-[10px] text-zinc-600 mt-0.5">
+                        bloquea BUYs si margin &gt; {form.marginGuardPct || "15"}%
+                      </p>
+                    </div>
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>

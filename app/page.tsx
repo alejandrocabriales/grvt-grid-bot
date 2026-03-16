@@ -1,6 +1,7 @@
 "use client";
 
 import { GridBotConfig } from "@/components/GridBotConfig";
+import { QuickTradePanel } from "@/components/QuickTradePanel";
 import { Dashboard } from "@/components/Dashboard";
 import { ActivityLog } from "@/components/ActivityLog";
 import { useGridBot } from "@/hooks/useGridBot";
@@ -77,7 +78,7 @@ export default function Home() {
       <main className="max-w-7xl mx-auto px-4 py-6">
         <div className="grid grid-cols-1 lg:grid-cols-[340px_1fr] gap-6">
           {/* Left: Config Panel */}
-          <aside>
+          <aside className="space-y-4">
             <GridBotConfig
               isRunning={isRunning}
               isConnecting={isConnecting}
@@ -85,6 +86,7 @@ export default function Home() {
               onStart={startBot}
               onStop={stopBot}
             />
+            <QuickTradePanel />
           </aside>
 
           {/* Right: Dashboard & Logs */}

@@ -33,6 +33,10 @@ export interface GridConfig {
   autoReposition?: boolean;    // reposicionar grilla automáticamente si precio sale del rango
   trendFilterEnabled?: boolean; // usar marketScore como filtro de tendencia (default true)
   autoRange?: boolean;         // calcular rango automáticamente desde ATR50
+  // ─── Módulos dinámicos avanzados ─────────────────────────────────────────
+  atrStepMult?: number;        // ATR * atrStepMult = distancia entre niveles (default 0.5)
+  marginGuardPct?: number;     // % de margin usado que pausa nuevas compras (default 15)
+  macroRsiExit?: boolean;      // activar salida parcial al RSI diario > 80
 }
 
 // ─── Tipos de Niveles y Estado ────────────────────────────────────────────────
@@ -193,6 +197,34 @@ export function calculateAutoRange(
     lowerPrice: parseFloat(Math.max(lowerPrice, currentPrice * 0.5).toFixed(2)),
     upperPrice: parseFloat(upperPrice.toFixed(2)),
   };
+}
+
+// ─── Grid Count Dinámico basado en ATR ───────────────────────────────────────
+
+/**
+ * Deriva el número óptimo de niveles de grilla a partir del ATR.
+ *
+ * Lógica:
+ *   gridStep = atr14 * atrStepMult   (distancia entre cada nivel)
+ *   gridCount = totalRange / gridStep
+ *
+ * Con atrStepMult=0.5: en alta volatilidad el bot automáticamente
+ * separa más los niveles (menos órdenes, mayor margen de seguridad).
+ * En baja volatilidad los niveles se comprimen para capturar micro-movimientos.
+ *
+ * Ejemplo: rango=$400, ATR14=$50, mult=0.5 → step=$25 → 16 niveles
+ */
+export function calculateAtrGridCount(
+  totalRange: number,
+  atr14: number,
+  atrStepMult = 0.5,
+  minGrids = 3,
+  maxGrids = 50
+): number {
+  const step = atr14 * atrStepMult;
+  if (step <= 0) return minGrids;
+  const count = Math.floor(totalRange / step);
+  return Math.max(minGrids, Math.min(maxGrids, count));
 }
 
 // ─── Tamaño de Orden ─────────────────────────────────────────────────────────

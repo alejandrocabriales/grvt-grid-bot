@@ -48,21 +48,16 @@ export async function POST(req: NextRequest) {
     const posSize = parseFloat(position.size);
     const isLong = posSize > 0;
     const absSize = Math.abs(posSize).toString();
-    const markPrice = parseFloat(position.mark_price);
-
-    // For market close: use a limit price with slippage
-    // Buy to close short → higher price; Sell to close long → lower price
-    const slippageMultiplier = isLong ? 0.95 : 1.05;
-    const limitPrice = (markPrice * slippageMultiplier).toFixed(2);
 
     const instrumentId = await getInstrumentId(instrument);
 
+    // Orden de mercado: GRVT requiere limit_price = "0" cuando isMarket = true
     const signedOrder = await signLimitOrder({
       subAccountId,
       instrument,
       instrumentId,
       size: absSize,
-      limitPrice,
+      limitPrice: "0",
       isBuying: !isLong, // opposite side to close
       isMarket: true,
       reduceOnly: true,
