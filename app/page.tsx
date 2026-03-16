@@ -2,6 +2,7 @@
 
 import { GridBotConfig } from "@/components/GridBotConfig";
 import { QuickTradePanel } from "@/components/QuickTradePanel";
+import { VolumeOptimizerPanel } from "@/components/VolumeOptimizerPanel";
 import { Dashboard } from "@/components/Dashboard";
 import { ActivityLog } from "@/components/ActivityLog";
 import { useGridBot } from "@/hooks/useGridBot";
@@ -86,6 +87,7 @@ export default function Home() {
               onStart={startBot}
               onStop={stopBot}
             />
+            <VolumeOptimizerPanel />
             <QuickTradePanel />
           </aside>
 
