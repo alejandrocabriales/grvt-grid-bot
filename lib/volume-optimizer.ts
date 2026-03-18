@@ -107,21 +107,33 @@ export type MarketRegime = "RANGING" | "TRENDING_UP" | "TRENDING_DOWN" | "VOLATI
  * Detecta el régimen de mercado para decidir qué sub-estrategia usar.
  *
  * RANGING (lateral):
- *   ADX < 20 AND volatilityRatio < maxVol → SPREAD_CAPTURE (grilla compacta)
+ *   ADX < 20 OR señales mixtas → SPREAD_CAPTURE (grilla compacta)
  *
  * TRENDING_UP/DOWN:
- *   ADX > 25 AND EMA21 vs EMA50 confirma dirección → SCALP_TREND
+ *   Sistema de votación: requiere ≥4 señales concordantes de 6 fuentes:
+ *     1. marketScore (peso 2): composite de EMA200/EMA50/Supertrend/ADX/RSI/BB
+ *     2. emaCrossState: GOLDEN=bull / DEATH=bear (estructura de tendencia)
+ *     3. supertrend: UP=bull / DOWN=bear
+ *     4. ADX direction: DI+ > DI- = bull / DI- > DI+ = bear
+ *     5. RSI momentum: >57=bull / <43=bear
+ *     6. EMA21 vs EMA50: short-term alignment
  *
  * VOLATILE_PAUSE:
  *   volatilityRatio > maxVol OR freefall → PAUSE (proteger capital)
+ *
+ * Previene abrir longs en mercados bajistas estructurales donde solo
+ * adx.bullishTrend=true por presión compradora de corto plazo.
  */
 export function detectMarketRegime(
   indicators: IndicatorsResult,
   maxVolatilityRatio: number
 ): MarketRegime {
-  const { adx, volatilityRatio, isFreefalling, marketPhase } = indicators;
+  const {
+    adx, volatilityRatio, isFreefalling, marketPhase, marketScore,
+    emaCrossState, supertrend, rsi, ema21, ema50,
+  } = indicators;
 
-  // Volatilidad extrema o colapso → pausar
+  // 1. Volatilidad extrema o colapso → pausar todo
   if (
     isFreefalling ||
     marketPhase === "COLLAPSE" ||
@@ -130,17 +142,94 @@ export function detectMarketRegime(
     return "VOLATILE_PAUSE";
   }
 
-  // ADX bajo → mercado lateral → ideal para spread capture
+  // 2. Sin tendencia en ADX → spread capture
   if (adx && !adx.trending) {
     return "RANGING";
   }
 
-  // ADX alto con dirección → scalping direccional
-  if (adx && adx.trending) {
-    return adx.bullishTrend ? "TRENDING_UP" : "TRENDING_DOWN";
+  // 3. Sistema de votación multi-señal
+  let bull = 0;
+  let bear = 0;
+
+  // Señal 1: marketScore (peso doble — ya integra EMA200, EMA50, supertrend, ADX, RSI, Bollinger)
+  if (marketScore >= 65) bull += 2;        // BULLISH / STRONG_BULL confirmado
+  else if (marketScore >= 53) bull += 1;   // ligeramente alcista
+  else if (marketScore <= 35) bear += 2;   // BEARISH / COLLAPSE confirmado
+  else if (marketScore <= 47) bear += 1;   // ligeramente bajista
+
+  // Señal 2: estructura de cruce de medias largas (EMA50 vs EMA200)
+  if (emaCrossState === "GOLDEN") bull++;
+  else if (emaCrossState === "DEATH") bear++;
+
+  // Señal 3: supertrend (integra ATR + precio)
+  if (supertrend?.isBullish === true) bull++;
+  else if (supertrend?.isBullish === false) bear++;
+
+  // Señal 4: dirección del ADX (DI+ vs DI-)
+  if (adx?.bullishTrend) bull++;
+  else if (adx?.trending) bear++;
+
+  // Señal 5: RSI momentum reciente
+  const lastRsi = rsi.at(-1);
+  if (lastRsi !== undefined) {
+    if (lastRsi > 57) bull++;
+    else if (lastRsi < 43) bear++;
   }
 
+  // Señal 6: alineación EMA21 vs EMA50 (short-term momentum)
+  if (ema21 !== null && ema50 !== null) {
+    if (ema21 > ema50) bull++;
+    else bear++;
+  }
+
+  // Requiere consenso claro: ≥4 señales Y más del 60% del total
+  const total = bull + bear;
+  if (total >= 3 && bull >= 4 && bull / total >= 0.6) return "TRENDING_UP";
+  if (total >= 3 && bear >= 4 && bear / total >= 0.6) return "TRENDING_DOWN";
+
+  // Señales mixtas → spread capture es más seguro
   return "RANGING";
+}
+
+/**
+ * Retorna un resumen de las señales de dirección para logging/debugging.
+ */
+export function explainMarketRegime(
+  indicators: IndicatorsResult
+): string {
+  const { adx, marketScore, emaCrossState, supertrend, rsi, ema21, ema50 } = indicators;
+  let bull = 0;
+  let bear = 0;
+  const parts: string[] = [];
+
+  if (marketScore >= 65) { bull += 2; parts.push(`Score:${marketScore}↑↑`); }
+  else if (marketScore >= 53) { bull += 1; parts.push(`Score:${marketScore}↑`); }
+  else if (marketScore <= 35) { bear += 2; parts.push(`Score:${marketScore}↓↓`); }
+  else if (marketScore <= 47) { bear += 1; parts.push(`Score:${marketScore}↓`); }
+  else parts.push(`Score:${marketScore}~`);
+
+  if (emaCrossState === "GOLDEN") { bull++; parts.push("Cross:GOLDEN↑"); }
+  else if (emaCrossState === "DEATH") { bear++; parts.push("Cross:DEATH↓"); }
+
+  if (supertrend?.isBullish === true) { bull++; parts.push("ST:UP↑"); }
+  else if (supertrend?.isBullish === false) { bear++; parts.push("ST:DOWN↓"); }
+
+  if (adx?.bullishTrend) { bull++; parts.push(`ADX:DI+>${adx.diMinus.toFixed(0)}↑`); }
+  else if (adx?.trending) { bear++; parts.push(`ADX:DI->${adx.diPlus.toFixed(0)}↓`); }
+
+  const lastRsi = rsi.at(-1);
+  if (lastRsi !== undefined) {
+    if (lastRsi > 57) { bull++; parts.push(`RSI:${lastRsi.toFixed(0)}↑`); }
+    else if (lastRsi < 43) { bear++; parts.push(`RSI:${lastRsi.toFixed(0)}↓`); }
+    else parts.push(`RSI:${lastRsi.toFixed(0)}~`);
+  }
+
+  if (ema21 !== null && ema50 !== null) {
+    if (ema21 > ema50) { bull++; parts.push("EMA21>50↑"); }
+    else { bear++; parts.push("EMA21<50↓"); }
+  }
+
+  return `Bull:${bull} Bear:${bear} | ${parts.join(" | ")}`;
 }
 
 // ─── Spread Capture Orders ──────────────────────────────────────────────────

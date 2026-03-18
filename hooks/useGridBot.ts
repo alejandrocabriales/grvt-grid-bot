@@ -136,7 +136,15 @@ export function useGridBot(): UseGridBotReturn {
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data as string);
-        const price = parseFloat(msg?.result?.mark_price ?? msg?.feed?.mark_price ?? "0");
+        // GRVT may nest price data in different fields depending on the instrument
+        const feed = msg?.result ?? msg?.feed ?? msg?.data ?? {};
+        const price = parseFloat(
+          feed?.mark_price ??
+          feed?.oracle_price ??
+          feed?.last_price ??
+          feed?.index_price ??
+          "0"
+        );
         if (price > 0) {
           setCurrentPrice(price);
           setState((prev) =>
@@ -172,6 +180,20 @@ export function useGridBot(): UseGridBotReturn {
           // Si el bot se detuvo en el servidor, limpiar WS
           if (!status.isRunning) {
             wsRef.current?.close();
+          }
+
+          // Fallback de precio REST: si el WS no entrega precio (XRP, SOL u otros pares),
+          // obtenerlo por polling cada vez que el currentPrice sea 0
+          if (status.isRunning && status.config.pair) {
+            setCurrentPrice((prev) => {
+              if (prev === 0) {
+                fetch(`/api/bot/price?instrument=${status.config!.pair}`)
+                  .then((r) => r.json())
+                  .then((d) => { if (d.price > 0) setCurrentPrice(d.price); })
+                  .catch(() => {/* silently ignore */});
+              }
+              return prev;
+            });
           }
 
           // Seguir polling

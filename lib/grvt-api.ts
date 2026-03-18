@@ -32,6 +32,22 @@ export interface GrvtSession {
   accountId: string;   // X-Grvt-Account-Id
 }
 
+// ─── TP/SL trigger types ─────────────────────────────────────────────────────
+
+export type TriggerType = "TAKE_PROFIT" | "STOP_LOSS";
+export type TriggerBy   = "INDEX" | "LAST" | "MID" | "MARK";
+
+export interface TpSlTrigger {
+  trigger_type: TriggerType;
+  tpsl: {
+    trigger_by: TriggerBy;
+    /** Trigger price with 9 decimal places, e.g. "50000.000000000" */
+    trigger_price: string;
+    /** true = close full position when triggered */
+    close_position: boolean;
+  };
+}
+
 export interface GrvtOrder {
   sub_account_id: string;
   is_market: boolean;
@@ -54,6 +70,8 @@ export interface GrvtOrder {
   };
   metadata: {
     client_order_id: string;
+    /** Optional TP/SL trigger — NOT included in EIP-712 signature */
+    trigger?: TpSlTrigger;
   };
 }
 
@@ -105,17 +123,23 @@ export async function getInstrumentInfo(instrument: string): Promise<InstrumentI
   }
 
   const data = await res.json();
-  const result = data.result || {};
+  // GRVT may return result as an object or inside a results array (varies by instrument)
+  const result = data.result ?? (Array.isArray(data.results) ? data.results[0] : null) ?? {};
 
   // Log the full response so we can see all available fields
   console.log(`[Instrument] Full response for ${instrument}:`, JSON.stringify(result, null, 2));
 
+  // Try multiple possible field names for the instrument hash
   const instrumentHash: string =
     result.instrument_hash?.toString() ||
-    result.instrument_id?.toString();
+    result.instrument_id?.toString() ||
+    result.id?.toString() ||
+    result.asset_id?.toString() ||
+    result.hash?.toString() ||
+    "";
 
   if (!instrumentHash) {
-    throw new Error(`No instrument_hash returned for ${instrument}. Response: ${JSON.stringify(data)}`);
+    throw new Error(`No instrument_hash returned for ${instrument}. Full API response: ${JSON.stringify(data)}`);
   }
 
   const tickSize = result.tick_size ?? "0.01";
@@ -235,6 +259,9 @@ export async function createOrder(
   session: GrvtSession,
   order: GrvtOrder
 ): Promise<{ order_id: string }> {
+  const payload = JSON.stringify({ order });
+  console.log(`[CreateOrder] Enviando orden → instrument=${order.legs?.[0]?.instrument} size=${order.legs?.[0]?.size} price=${order.legs?.[0]?.limit_price} buy=${order.legs?.[0]?.is_buying_asset}`);
+
   const res = await fetch(`${getBaseUrls().rest}/full/v1/create_order`, {
     method: "POST",
     headers: {
@@ -242,15 +269,18 @@ export async function createOrder(
       Cookie: session.cookie,
       "X-Grvt-Account-Id": session.accountId,
     },
-    body: JSON.stringify({ order }),
+    body: payload,
   });
 
   if (!res.ok) {
     const text = await res.text();
+    console.error(`[CreateOrder] FALLO (${res.status}): ${text}`);
+    console.error(`[CreateOrder] Payload enviado: ${payload}`);
     throw new Error(`Create order failed (${res.status}): ${text}`);
   }
 
   const data = await res.json();
+  console.log(`[CreateOrder] OK → order_id=${data.result?.order_id || data.order_id}`);
   return { order_id: data.result?.order_id || data.order_id || "" };
 }
 

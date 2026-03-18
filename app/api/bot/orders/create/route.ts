@@ -10,7 +10,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { readEnvCredentials } from "@/lib/server/env";
 import { clearSession, getStoredSession, saveSession } from "@/lib/server/session-store";
 import { signLimitOrder } from "@/lib/eip712";
-import { createOrder, getInstrumentId, loginWithApiKey } from "@/lib/grvt-api";
+import { createOrder, getInstrumentInfo, loginWithApiKey } from "@/lib/grvt-api";
 
 export async function POST(req: NextRequest) {
   try {
@@ -50,19 +50,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Obtener el instrument ID (uint256) requerido para EIP-712
-    const instrumentId = await getInstrumentId(instrument);
+    // Obtener info del instrumento (hash + baseDecimals para EIP-712)
+    const instrInfo = await getInstrumentInfo(instrument);
 
     // Firma la orden en el servidor
     const signedOrder = await signLimitOrder({
       subAccountId,
       instrument,
-      instrumentId,
+      instrumentId: instrInfo.instrumentHash,
       size,
       limitPrice,
       isBuying,
       privateKey,
       useTestnet,
+      baseDecimals: instrInfo.baseDecimals,
     });
 
     // Envía a GRVT — reintenta con nueva sesión si recibe 403 (sesión expirada)

@@ -35,6 +35,24 @@ const SUPPORTED_PAIRS = [
   "XRP_USDT_Perp",
 ];
 
+// Redondeo con precisión decimal apropiada según el rango de precio.
+// Evita que Math.floor/ceil elimine todos los decimales para activos < $10 (XRP, SOL, ARB, OP)
+function priceDecimalsFor(price: number): number {
+  if (price >= 1000) return 0;
+  if (price >= 100) return 1;
+  if (price >= 10) return 2;
+  if (price >= 1) return 3;
+  return 4;
+}
+function floorTo(price: number): number {
+  const f = 10 ** priceDecimalsFor(price);
+  return Math.floor(price * f) / f;
+}
+function ceilTo(price: number): number {
+  const f = 10 ** priceDecimalsFor(price);
+  return Math.ceil(price * f) / f;
+}
+
 // ─── Tipos para el estado de credenciales ────────────────────────────────────
 
 interface CredStatus {
@@ -87,7 +105,7 @@ export function GridBotConfig({
     atrMultiplier: "1.5",
     riskPerTrade: "1.5",
     maxDrawdownPct: "15",
-    enableTrailingStop: true,
+    enableTrailingStop: false,   // OFF por defecto: el trailing stop detiene el bot completo en grid
     trailingAtrMult: "2.0",
     autoReposition: true,
     trendFilterEnabled: true,
@@ -95,7 +113,7 @@ export function GridBotConfig({
     autoRange: false,
     // ─── Módulos dinámicos avanzados ───────────────────────────────────────
     atrStepMult: "0.5",
-    marginGuardPct: "15",
+    marginGuardPct: "80",  // Alto para no bloquear counter-orders en modo grid
     macroRsiExit: false,
   });
 
@@ -109,6 +127,9 @@ export function GridBotConfig({
   const [selectedPresetIdx, setSelectedPresetIdx] = useState<number | null>(null);
   // Sesgo de mercado detectado automáticamente al cargar el par
   const [detectedBias, setDetectedBias] = useState<"BULLISH" | "BEARISH" | "NEUTRAL" | null>(null);
+  // Escaneo de todos los pares para sugerir el mejor
+  const [scanLoading, setScanLoading] = useState(false);
+  const [bestPair, setBestPair] = useState<{ pair: string; bias: "BULLISH" | "BEARISH"; strength: number } | null>(null);
 
   // Verificar credenciales al montar (llama /api/credentials)
   useEffect(() => {
@@ -178,8 +199,8 @@ export function GridBotConfig({
           setForm((f) => {
             const needsAutoFill = !f.lowerPrice && !f.upperPrice;
             if (needsAutoFill) {
-              const lower = Math.floor(price * 0.97);
-              const upper = Math.ceil(price * 1.03);
+              const lower = floorTo(price * 0.97);
+              const upper = ceilTo(price * 1.03);
               return { ...f, lowerPrice: String(lower), upperPrice: String(upper) };
             }
             return f;
@@ -211,6 +232,43 @@ export function GridBotConfig({
     const interval = setInterval(fetchPriceAndBias, 30_000); // Cada 30s (no tan frecuente)
     return () => { cancelled = true; clearInterval(interval); };
   }, [form.pair]);
+
+  // Escanear todos los pares para encontrar el de tendencia más clara
+  const scanAllPairs = async () => {
+    setScanLoading(true);
+    setBestPair(null);
+    try {
+      const results = await Promise.all(
+        SUPPORTED_PAIRS.map(async (p) => {
+          try {
+            const [priceRes, klinesRes] = await Promise.all([
+              fetch(`/api/bot/price?instrument=${p}`),
+              fetch(`/api/bot/klines?instrument=${p}&interval=5m&limit=220`),
+            ]);
+            const priceData = await priceRes.json();
+            const klinesData = await klinesRes.json();
+            if (!priceData.price || !klinesData.ok || !klinesData.klines?.length) return null;
+            const indicators = calculateIndicators(klinesData.klines);
+            const bias = detectMarketBiasLegacy(priceData.price, indicators.ema50, indicators.ema200, indicators.rsi);
+            const strength = Math.abs(indicators.trendStrength ?? 0);
+            return { pair: p, bias, strength, trendStrength: indicators.trendStrength ?? 0 };
+          } catch {
+            return null;
+          }
+        })
+      );
+      const valid = results.filter((r) => r !== null && r.bias !== "NEUTRAL") as { pair: string; bias: "BULLISH" | "BEARISH"; strength: number; trendStrength: number }[];
+      if (valid.length > 0) {
+        valid.sort((a, b) => b.strength - a.strength);
+        const top = valid[0];
+        setBestPair({ pair: top.pair, bias: top.bias, strength: top.trendStrength });
+      }
+    } catch {
+      // silently fail
+    } finally {
+      setScanLoading(false);
+    }
+  };
 
   const set = (key: string) => (e: React.ChangeEvent<HTMLInputElement>) => {
     setForm((f) => ({ ...f, [key]: e.target.value }));
@@ -401,9 +459,45 @@ export function GridBotConfig({
                 </SelectContent>
               </Select>
             </div>
-            <label className="text-xs text-zinc-500 mb-1 block">
-              Par de Trading
-            </label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-xs text-zinc-500">Par de Trading</label>
+              <button
+                type="button"
+                onClick={scanAllPairs}
+                disabled={scanLoading || isRunning}
+                className="flex items-center gap-1 text-[10px] text-blue-400 hover:text-blue-300 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {scanLoading ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <span>⚡</span>
+                )}
+                {scanLoading ? "Escaneando..." : "Mejor par"}
+              </button>
+            </div>
+            {bestPair && (
+              <button
+                type="button"
+                onClick={() => {
+                  setForm((f) => ({ ...f, pair: bestPair.pair, lowerPrice: "", upperPrice: "" }));
+                  setStrategyTip(null);
+                }}
+                disabled={isRunning}
+                className={`w-full mb-1.5 flex items-center justify-between text-[10px] px-2 py-1.5 rounded border cursor-pointer ${
+                  bestPair.bias === "BULLISH"
+                    ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/20"
+                    : "bg-red-500/10 border-red-500/30 text-red-300 hover:bg-red-500/20"
+                }`}
+              >
+                <span>
+                  Recomendado: <strong>{bestPair.pair.replace("_USDT_Perp", "")}</strong>
+                  {" "}({bestPair.bias === "BULLISH" ? "↑ Alcista" : "↓ Bajista"})
+                </span>
+                <span className="font-mono font-bold">
+                  {bestPair.strength > 0 ? "+" : ""}{bestPair.strength.toFixed(1)}%
+                </span>
+              </button>
+            )}
             <Select
               value={form.pair}
               onValueChange={(v) => {
@@ -575,8 +669,8 @@ export function GridBotConfig({
                     const isSelected = selectedPresetIdx === i;
                     const isDefault = i === 0 && selectedPresetIdx === null; // Intraday destacada por defecto
                     const isBearish = detectedBias === "BEARISH";
-                    const slVal = isShort ? Math.ceil(livePrice * s.slPct) : Math.floor(livePrice * s.slPct);
-                    const tpVal = isShort ? Math.floor(livePrice * s.tpPct) : Math.ceil(livePrice * s.tpPct);
+                    const slVal = isShort ? ceilTo(livePrice * s.slPct) : floorTo(livePrice * s.slPct);
+                    const tpVal = isShort ? floorTo(livePrice * s.tpPct) : ceilTo(livePrice * s.tpPct);
 
                     // Estilo del botón:
                     // - Seleccionado: borde sólido + fondo intenso
@@ -619,8 +713,8 @@ export function GridBotConfig({
                           setForm((f) => ({
                             ...f,
                             strategyMode: recommendedMode,
-                            lowerPrice: String(Math.floor(livePrice * s.lowerPct)),
-                            upperPrice: String(Math.ceil(livePrice * s.upperPct)),
+                            lowerPrice: String(floorTo(livePrice * s.lowerPct)),
+                            upperPrice: String(ceilTo(livePrice * s.upperPct)),
                             gridCount: s.grids,
                             leverage: s.leverage,
                             stopLoss: String(slVal),
@@ -645,7 +739,7 @@ export function GridBotConfig({
                         </span>
                         <br />
                         <span className={`text-[10px] ${isSelected ? "text-zinc-400" : "text-zinc-600"}`}>
-                          ${Math.floor(livePrice * s.lowerPct).toLocaleString()}–${Math.ceil(livePrice * s.upperPct).toLocaleString()} · {s.grids} grids · {s.leverage}x
+                          ${floorTo(livePrice * s.lowerPct).toLocaleString()}–${ceilTo(livePrice * s.upperPct).toLocaleString()} · {s.grids} grids · {s.leverage}x
                         </span>
                       </button>
                     );
@@ -666,7 +760,7 @@ export function GridBotConfig({
                 type="number"
                 value={form.lowerPrice}
                 onChange={set("lowerPrice")}
-                placeholder={livePrice ? String(Math.floor(livePrice * 0.95)) : ""}
+                placeholder={livePrice ? String(floorTo(livePrice * 0.95)) : ""}
                 className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
                 disabled={isRunning}
               />
@@ -679,7 +773,7 @@ export function GridBotConfig({
                 type="number"
                 value={form.upperPrice}
                 onChange={set("upperPrice")}
-                placeholder={livePrice ? String(Math.ceil(livePrice * 1.05)) : ""}
+                placeholder={livePrice ? String(ceilTo(livePrice * 1.05)) : ""}
                 className="bg-zinc-800 border-zinc-600 text-zinc-200 text-xs"
                 disabled={isRunning}
               />
@@ -736,8 +830,8 @@ export function GridBotConfig({
                   onClick={() => {
                     setForm((f) => ({
                       ...f,
-                      lowerPrice: String(Math.floor(livePrice * 0.97)),
-                      upperPrice: String(Math.ceil(livePrice * 1.03)),
+                      lowerPrice: String(floorTo(livePrice * 0.97)),
+                      upperPrice: String(ceilTo(livePrice * 1.03)),
                     }));
                   }}
                 >

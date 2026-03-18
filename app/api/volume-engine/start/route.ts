@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { startVolumeEngine, isVolumeEngineRunning } from "@/lib/server/volume-process";
+import { startVolumeEngine, stopVolumeEngine, isVolumeEngineRunning } from "@/lib/server/volume-process";
 import type { VolumeConfig } from "@/lib/volume-optimizer";
 import fs from "fs";
 import path from "path";
@@ -14,7 +14,10 @@ export async function POST(req: NextRequest) {
     }
 
     if (isVolumeEngineRunning()) {
-      return NextResponse.json({ ok: false, error: "Volume engine already running" }, { status: 409 });
+      // Auto-stop existing engine so user can switch pairs without manual stop
+      stopVolumeEngine();
+      // Brief wait for process to release resources
+      await new Promise((r) => setTimeout(r, 1_500));
     }
 
     const dbDir = process.env.VOL_DB_PATH

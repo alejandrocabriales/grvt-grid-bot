@@ -62,5 +62,11 @@ export function getEnginePid(): number | null {
 }
 
 export function isEngineRunning(): boolean {
-  return g.__engineProcess != null && !g.__engineProcess.killed;
+  const proc = g.__engineProcess;
+  if (!proc) return false;
+  if (proc.killed || proc.exitCode !== null || proc.signalCode !== null) {
+    g.__engineProcess = null;
+    return false;
+  }
+  return true;
 }
