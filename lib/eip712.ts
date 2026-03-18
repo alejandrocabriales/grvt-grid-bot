@@ -56,6 +56,10 @@ export interface SignedOrderParams {
   reduceOnly?: boolean;
   privateKey: string;
   useTestnet?: boolean;
+  /** Decimal places for contractSize encoding — varies per instrument (9 for BTC/ETH, may differ for XRP/SOL) */
+  baseDecimals?: number;
+  /** Optional TP/SL trigger appended to metadata — NOT included in EIP-712 signature */
+  trigger?: import("./grvt-api").TpSlTrigger;
 }
 
 export interface SignedOrder {
@@ -80,6 +84,7 @@ export interface SignedOrder {
   };
   metadata: {
     client_order_id: string;
+    trigger?: import("./grvt-api").TpSlTrigger;
   };
 }
 
@@ -109,6 +114,8 @@ export async function signLimitOrder(
     reduceOnly = false,
     privateKey,
     useTestnet = false,
+    baseDecimals = 9,
+    trigger,
   } = params;
 
   const wallet = new ethers.Wallet(privateKey);
@@ -132,7 +139,7 @@ export async function signLimitOrder(
     legs: [
       {
         assetID: BigInt(instrumentId),
-        contractSize: toGrvtDecimals(size),
+        contractSize: toGrvtDecimals(size, baseDecimals),
         limitPrice: toGrvtDecimals(limitPrice),
         isBuyingContract: isBuying,
       },
@@ -169,6 +176,8 @@ export async function signLimitOrder(
     },
     metadata: {
       client_order_id: String(nonce),
+      // trigger is NOT signed — it is appended only to the REST payload
+      ...(trigger ? { trigger } : {}),
     },
   };
 }

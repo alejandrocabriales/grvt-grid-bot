@@ -56,5 +56,12 @@ export function stopVolumeEngine(): void {
 }
 
 export function isVolumeEngineRunning(): boolean {
-  return g.__volumeProcess != null && !g.__volumeProcess.killed;
+  const proc = g.__volumeProcess;
+  if (!proc) return false;
+  // Also detect processes that exited on their own (crash, init error, etc.)
+  if (proc.killed || proc.exitCode !== null || proc.signalCode !== null) {
+    g.__volumeProcess = null;
+    return false;
+  }
+  return true;
 }

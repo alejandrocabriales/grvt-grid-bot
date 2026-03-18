@@ -13,7 +13,6 @@ import { clearSession, getStoredSession, saveSession } from "@/lib/server/sessio
 import { signLimitOrder } from "@/lib/eip712";
 import {
   createOrder,
-  getInstrumentId,
   getInstrumentInfo,
   loginWithApiKey,
 } from "@/lib/grvt-api";
@@ -81,18 +80,17 @@ export async function POST(req: NextRequest) {
     // Orden de mercado: GRVT requiere limit_price = "0" cuando isMarket = true
     const isBuying = direction === "long";
 
-    const instrumentId = await getInstrumentId(instrument);
-
     const signedOrder = await signLimitOrder({
       subAccountId,
       instrument,
-      instrumentId,
+      instrumentId: instrumentInfo.instrumentHash,
       size,
       limitPrice: "0",
       isBuying,
       isMarket: true,
       privateKey,
       useTestnet,
+      baseDecimals: instrumentInfo.baseDecimals,
     });
 
     let orderResult;

@@ -33,6 +33,7 @@ import {
   calculateGridLevels,
   calculateAutoRange,
   calculateAtrGridCount,
+  calculateOrderSize,
   getInitialOrders,
   getCounterOrder,
   calculateMaxGrids,
@@ -53,6 +54,7 @@ import { BotDatabase, type DbOrder } from "./db";
 const ORDER_POLL_MS      = 3_000;   // Poll fills cada 3 s
 const POSITION_POLL_MS   = 5_000;   // Poll posición / drawdown / trailing stop cada 5 s
 const INDICATORS_POLL_MS = 60_000;  // Actualizar indicadores cada 60 s
+const GRID_HEAL_MS       = 30_000;  // Reparar niveles vacíos del grid cada 30 s (Pionex-style)
 const SESSION_TTL_MS     = 50 * 60 * 1_000; // Renovar sesión a los 50 min
 
 const RETRY_BASE_MS      = 1_000;
@@ -68,6 +70,21 @@ function sleep(ms: number): Promise<void> {
 /** Prefijos visuales para la consola */
 const ICONS = { info: "ℹ", warn: "⚠", error: "✖", success: "✔" } as const;
 
+// ─── Log a archivo ─────────────────────────────────────────────────────────
+import fs from "fs";
+import path from "path";
+
+const LOG_FILE = path.join(process.cwd(), "engine-debug.log");
+
+function writeLogFile(level: string, msg: string): void {
+  try {
+    const line = `[${new Date().toISOString()}] [${level.toUpperCase()}] ${msg}\n`;
+    fs.appendFileSync(LOG_FILE, line, "utf8");
+  } catch {
+    // no bloquear si falla escritura a disco
+  }
+}
+
 function log(
   db: BotDatabase,
   level: "info" | "warn" | "error" | "success",
@@ -76,6 +93,7 @@ function log(
   const ts = new Date().toISOString();
   console.log(`[${ts}] ${ICONS[level]} ${msg}`);
   db.appendLog(level, msg);
+  writeLogFile(level, msg);
 }
 
 /**
@@ -150,6 +168,7 @@ export class GridEngine {
   private sizeDecimals       = 2;
   private minSize            = 0.01;
   private instrumentHash     = "";
+  private baseDecimals       = 9;
 
   // Estado de mercado
   private currentPrice       = 0;
@@ -167,6 +186,11 @@ export class GridEngine {
   private dailyRsi: number | null          = null;  // RSI(14) diario
   private marginGuardActive                = false; // pausa compras si margin > umbral
   private macroExitApplied                 = false; // salida parcial aplicada (no repetir)
+
+  // TP/SL tracking
+  private tpOrderId: string | null         = null;  // ID de orden TP activa en exchange
+  private slOrderId: string | null         = null;  // ID de orden SL activa en exchange
+  private tpslEntryPrice: number | null    = null;  // precio de entrada cuando se colocó TP/SL
 
   // Stats
   private totalPnL     = 0;
@@ -245,6 +269,7 @@ export class GridEngine {
         reduceOnly,
         privateKey,
         useTestnet,
+        baseDecimals: this.baseDecimals,
       });
 
       const result  = await createOrder(session, signed);
@@ -275,6 +300,13 @@ export class GridEngine {
     this.db.setConfig("grid_config", this.config);
     this.db.setConfig("start_time", Date.now());
 
+    // Limpiar métricas volátiles de ejecuciones anteriores (cambio de par u otros)
+    this.db.setMetric("trailing_stop_price", null);
+    this.db.setMetric("peak_price", null);
+    this.db.setMetric("trough_price", null);
+    this.db.setMetric("total_pnl", 0);
+    this.db.setMetric("filled_orders", 0);
+
     // Metadatos del instrumento
     const info = await withRetry(
       () => getInstrumentInfo(this.config.pair),
@@ -283,9 +315,11 @@ export class GridEngine {
       5
     );
     this.instrumentHash = info.instrumentHash;
+    this.baseDecimals   = info.baseDecimals;
     this.priceDecimals  = info.priceDecimals;
     this.sizeDecimals   = info.sizeDecimals;
     this.minSize        = parseFloat(info.minSize);
+    log(this.db, "info", `[Instrument] hash=${this.instrumentHash} | baseDecimals=${this.baseDecimals} | tick=${info.tickSize} | minSize=${info.minSize} | sizeDecimals=${this.sizeDecimals} | priceDecimals=${this.priceDecimals}`);
 
     // Precio actual (última vela 1m de Binance)
     const klines = await getBinanceKlines(this.config.pair, "1m", 3);
@@ -414,6 +448,7 @@ export class GridEngine {
       5
     );
     this.instrumentHash = info.instrumentHash;
+    this.baseDecimals   = info.baseDecimals;
     this.priceDecimals  = info.priceDecimals;
     this.sizeDecimals   = info.sizeDecimals;
     this.minSize        = parseFloat(info.minSize);
@@ -503,8 +538,23 @@ export class GridEngine {
       return;
     }
 
-    // Módulo 3: si el margin guard está activo, bloquear nuevas compras
-    if (this.marginGuardActive && counter.type === "buy") {
+    // ── Evitar órdenes duplicadas en el mismo nivel ──────────────────────────
+    // Si ya hay una orden 'open' en la DB a este precio, no colocar otra
+    // (puede ocurrir cuando la orden inicial y la contra-orden coinciden en nivel)
+    const dbOpen = this.db.getOpenOrders(this.config.pair);
+    const alreadyOpen = dbOpen.some(
+      (o) => o.order_id && Math.abs(o.price - counter.price) / counter.price < 0.0005
+    );
+    if (alreadyOpen) {
+      log(this.db, "info", `[Counter] Nivel $${counter.price.toFixed(this.priceDecimals)} ya tiene orden activa — omitiendo duplicado`);
+      return;
+    }
+
+    // ── Módulo 3: Margin guard (solo aplica en modos direccionales) ──────────
+    // En modos de grilla, el capital ya está comprometido — bloquear counter-orders
+    // rompe el ciclo buy→sell→buy y cancela el volumen generado.
+    const isGridMode = ["NEUTRAL_GRID", "LONG_GRID", "SHORT_GRID", "AUTO_GRID"].includes(this.config.strategyMode);
+    if (!isGridMode && this.marginGuardActive && counter.type === "buy") {
       log(this.db, "warn", `[MarginGuard] Contra-orden BUY @ $${counter.price} bloqueada (margin guard activo)`);
       return;
     }
@@ -710,16 +760,36 @@ export class GridEngine {
         }
       }
 
-      // ── Trailing stop dinámico (requiere posición abierta) ─────────────────
-      if (this.config.enableTrailingStop && this.indicators?.atr) {
-        const positions = await getPositions(session, subAccountId, this.config.pair);
-        const position  = positions.find((p) => p.instrument === this.config.pair) ?? null;
+      // ── Posición abierta: TP/SL nativo + trailing stop ────────────────────
+      const positions = await getPositions(session, subAccountId, this.config.pair);
+      const position  = positions.find((p) => p.instrument === this.config.pair) ?? null;
 
-        if (position) {
-          const posSize   = parseFloat(position.size);
-          const markPrice = parseFloat(position.mark_price);
-          const isLong    = posSize > 0;
+      if (position) {
+        const posSize    = parseFloat(position.size);
+        const markPrice  = parseFloat(position.mark_price);
+        const entryPrice = parseFloat(position.entry_price);
+        const isLong     = posSize > 0;
+        const absSizeStr = Math.abs(posSize).toFixed(this.sizeDecimals);
 
+        // ── TP/SL nativo 1:2 ────────────────────────────────────────────────
+        // Coloca TP/SL cuando:
+        //   a) No hay órdenes TP/SL activas aún, O
+        //   b) El precio de entrada cambió >0.3% (posición creció / promedió)
+        const entryChanged = this.tpslEntryPrice !== null &&
+          Math.abs(entryPrice - this.tpslEntryPrice) / entryPrice > 0.003;
+        const noTpsl = !this.tpOrderId && !this.slOrderId;
+
+        if (Math.abs(posSize) > 0 && (noTpsl || entryChanged)) {
+          if (entryChanged) {
+            log(this.db, "info", `[TPSL] Entrada cambió de $${this.tpslEntryPrice?.toFixed(this.priceDecimals)} → $${entryPrice.toFixed(this.priceDecimals)} → recolocando TP/SL`);
+            this.tpOrderId = null;
+            this.slOrderId = null;
+          }
+          await this.placeTPSLOrders(entryPrice, absSizeStr, isLong);
+        }
+
+        // ── Trailing stop dinámico (complementario al TP/SL nativo) ─────────
+        if (this.config.enableTrailingStop && this.indicators?.atr) {
           if (isLong) {
             const peakOrTrough = this.peakPrice ?? markPrice;
             const result = calculateTrailingStop(
@@ -742,6 +812,14 @@ export class GridEngine {
               return;
             }
           }
+        }
+      } else {
+        // Sin posición → resetear tracking de TP/SL
+        if (this.tpOrderId || this.slOrderId) {
+          this.tpOrderId      = null;
+          this.slOrderId      = null;
+          this.tpslEntryPrice = null;
+          log(this.db, "info", "[TPSL] Posición cerrada — TP/SL reseteados");
         }
       }
 
@@ -781,6 +859,112 @@ export class GridEngine {
 
     if (this.running) {
       setTimeout(() => this.indicatorsPollingLoop(), INDICATORS_POLL_MS);
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  BUCLE 4 — INTEGRIDAD DE LA GRILLA (cada 30 s) — Pionex-style
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Garantiza que TODOS los niveles del grid tengan una orden activa.
+   *
+   * Invariante Pionex:
+   *   • nivel < precio actual → orden BUY activa
+   *   • nivel > precio actual → orden SELL activa
+   *   • nivel dentro del 0.1% del precio → ignorar (evitar fill inmediato)
+   *
+   * Los huecos se forman por: fills no reemplazados, errores de API,
+   * bloqueos de margin guard o reinicio del proceso. Este bucle los repara
+   * cada 30 s para mantener el volumen máximo (como Pionex hace internamente).
+   */
+  private async gridHealLoop(): Promise<void> {
+    if (!this.running) return;
+
+    if (this.currentPrice <= 0 || this.levels.length === 0) {
+      if (this.running) setTimeout(() => this.gridHealLoop(), GRID_HEAL_MS);
+      return;
+    }
+
+    try {
+      const session      = await this.ensureSession();
+      const subAccountId = process.env.GRVT_SUB_ACCOUNT_ID!;
+
+      // Precios con orden viva en el exchange
+      const exchangeOrders = await getOpenOrders(session, subAccountId, this.config.pair);
+      const liveSet = new Set(
+        exchangeOrders.map((o) => parseFloat(o.limit_price).toFixed(this.priceDecimals))
+      );
+
+      // Precios con orden pendiente u open en la DB (evita duplicar mientras se envía)
+      const dbOpen = this.db.getOpenOrders(this.config.pair);
+      const dbPriceSet = new Set(
+        dbOpen.map((o) => o.price.toFixed(this.priceDecimals))
+      );
+
+      const direction = getGridDirection(this.config.strategyMode, this.marketBias);
+      let healed = 0;
+
+      for (const level of this.levels) {
+        // Ignorar niveles muy cercanos al precio actual (evitan fill instantáneo)
+        if (Math.abs(level - this.currentPrice) / this.currentPrice < 0.001) continue;
+
+        // Tipo esperado según la dirección del grid y precio actual
+        let expectedType: "buy" | "sell";
+        if (direction === "SHORT") {
+          expectedType = level > this.currentPrice ? "sell" : "buy";
+        } else {
+          // LONG o NEUTRAL
+          expectedType = level < this.currentPrice ? "buy" : "sell";
+        }
+
+        // Respetar margin guard: no abrir nuevas compras si el margen está saturado
+        if (this.marginGuardActive && expectedType === "buy") continue;
+
+        // Filtro macro 4H: bloquear compras en LONG_GRID si precio < EMA200 4H
+        if (
+          this.macro4hEma200 !== null &&
+          this.currentPrice < this.macro4hEma200 &&
+          expectedType === "buy" &&
+          this.config.strategyMode === "LONG_GRID"
+        ) continue;
+
+        const priceKey = level.toFixed(this.priceDecimals);
+
+        // ¿Ya existe una orden activa en este nivel? → saltar
+        if (liveSet.has(priceKey) || dbPriceSet.has(priceKey)) continue;
+
+        // Calcular tamaño de la orden faltante
+        const size = calculateOrderSize(
+          this.config.totalInvestment,
+          this.config.gridCount,
+          level,
+          this.sizeDecimals,
+          this.config.leverage
+        );
+
+        if (parseFloat(size) < this.minSize) continue;
+
+        await this.placeLimitOrder(level, expectedType, size, this.levels.indexOf(level));
+        healed++;
+        await sleep(200); // Pequeña pausa entre órdenes para no saturar la API
+      }
+
+      if (healed > 0) {
+        log(this.db, "info", `[GridHeal] ${healed} nivel(es) restaurado(s) — grid completo`);
+      }
+
+    } catch (err: unknown) {
+      if (err instanceof AuthError) {
+        this.session = null;
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        log(this.db, "warn", `[GridHeal] Error: ${msg}`);
+      }
+    }
+
+    if (this.running) {
+      setTimeout(() => this.gridHealLoop(), GRID_HEAL_MS);
     }
   }
 
@@ -850,6 +1034,135 @@ export class GridEngine {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  //  TP/SL NATIVO — ratio 1:2 basado en ATR
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Coloca dos órdenes en el exchange:
+   *   STOP_LOSS  → entryPrice - ATR14 * slMult   (riesgo 1 unidad)
+   *   TAKE_PROFIT → entryPrice + ATR14 * tpMult  (ganancia 2 unidades → ratio 1:2)
+   *
+   * Ambas son reduce_only con close_position:true para cerrar la posición completa.
+   * El trigger usa MARK price (estándar para perpetuos).
+   *
+   * Error 2116: solo 1 TP y 1 SL activo por vez → cancelamos los anteriores primero.
+   */
+  private async placeTPSLOrders(
+    entryPrice: number,
+    positionSize: string,
+    isLong: boolean
+  ): Promise<void> {
+    const atr = this.indicators?.atr14;
+    if (!atr || atr <= 0) {
+      log(this.db, "warn", "[TPSL] ATR14 no disponible — usando config estática");
+    }
+
+    const privateKey   = process.env.GRVT_PRIVATE_KEY_EIP712!;
+    const subAccountId = process.env.GRVT_SUB_ACCOUNT_ID!;
+    const useTestnet   = process.env.GRVT_USE_TESTNET === "true";
+
+    // Ratio 1:2 — arriesgar 1.5 ATR para ganar 3 ATR
+    const slMult = 1.5;
+    const tpMult = 3.0;
+    const riskDist   = atr ? atr * slMult : entryPrice * 0.02; // fallback 2%
+    const rewardDist = atr ? atr * tpMult : entryPrice * 0.04; // fallback 4%
+
+    const slPrice = isLong
+      ? entryPrice - riskDist
+      : entryPrice + riskDist;
+    const tpPrice = isLong
+      ? entryPrice + rewardDist
+      : entryPrice - rewardDist;
+
+    // Formatear con 9 decimales (requerido por GRVT para trigger_price)
+    const fmt9 = (n: number) => n.toFixed(9);
+
+    log(
+      this.db,
+      "info",
+      `[TPSL] Colocando TP @ $${tpPrice.toFixed(this.priceDecimals)} | SL @ $${slPrice.toFixed(this.priceDecimals)} | Ratio 1:${(rewardDist / riskDist).toFixed(1)} | ${isLong ? "LONG" : "SHORT"}`
+    );
+
+    const session = await this.ensureSession();
+
+    // — TAKE PROFIT —
+    try {
+      const tpSigned = await signLimitOrder({
+        subAccountId,
+        instrument:   this.config.pair,
+        instrumentId: this.instrumentHash,
+        size:         positionSize,
+        limitPrice:   isLong ? fmt9(tpPrice * 0.999) : fmt9(tpPrice * 1.001), // slight buffer para fill
+        isBuying:     !isLong, // long cierra vendiendo; short cierra comprando
+        isMarket:     false,
+        reduceOnly:   true,
+        privateKey,
+        useTestnet,
+        baseDecimals: this.baseDecimals,
+        trigger: {
+          trigger_type: "TAKE_PROFIT",
+          tpsl: {
+            trigger_by:    "MARK",
+            trigger_price: fmt9(tpPrice),
+            close_position: true,
+          },
+        },
+      });
+
+      const tpResult = await createOrder(session, tpSigned);
+      this.tpOrderId     = tpResult.order_id;
+      this.tpslEntryPrice = entryPrice;
+      log(this.db, "success", `[TP] Orden colocada ID: ${this.tpOrderId} @ $${tpPrice.toFixed(this.priceDecimals)}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Error 2117 = solo desde web/mobile → caer a software TP
+      if (msg.includes("2117")) {
+        log(this.db, "warn", `[TP] API bloqueó TPSL nativo (2117) — usando software TP @ $${tpPrice.toFixed(this.priceDecimals)}`);
+        this.config.takeProfit = tpPrice;
+      } else {
+        log(this.db, "warn", `[TP] Error: ${msg}`);
+      }
+    }
+
+    // — STOP LOSS —
+    try {
+      const slSigned = await signLimitOrder({
+        subAccountId,
+        instrument:   this.config.pair,
+        instrumentId: this.instrumentHash,
+        size:         positionSize,
+        limitPrice:   isLong ? fmt9(slPrice * 0.998) : fmt9(slPrice * 1.002), // buffer para slippage
+        isBuying:     !isLong,
+        isMarket:     false,
+        reduceOnly:   true,
+        privateKey,
+        useTestnet,
+        baseDecimals: this.baseDecimals,
+        trigger: {
+          trigger_type: "STOP_LOSS",
+          tpsl: {
+            trigger_by:    "MARK",
+            trigger_price: fmt9(slPrice),
+            close_position: true,
+          },
+        },
+      });
+
+      const slResult = await createOrder(session, slSigned);
+      this.slOrderId = slResult.order_id;
+      log(this.db, "success", `[SL] Orden colocada ID: ${this.slOrderId} @ $${slPrice.toFixed(this.priceDecimals)}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("2117")) {
+        log(this.db, "warn", `[SL] API bloqueó TPSL nativo (2117) — usando software SL @ $${slPrice.toFixed(this.priceDecimals)}`);
+        this.config.stopLoss = slPrice;
+      } else {
+        log(this.db, "warn", `[SL] Error: ${msg}`);
+      }
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   //  STOP DE EMERGENCIA
   // ══════════════════════════════════════════════════════════════════════════
 
@@ -857,15 +1170,55 @@ export class GridEngine {
     log(this.db, "warn", "Stop de emergencia: cancelando todas las órdenes...");
     this.running = false;
 
+    const privateKey   = process.env.GRVT_PRIVATE_KEY_EIP712;
+    const subAccountId = process.env.GRVT_SUB_ACCOUNT_ID!;
+    const useTestnet   = process.env.GRVT_USE_TESTNET === "true";
+
     try {
-      const session      = await this.ensureSession();
-      const subAccountId = process.env.GRVT_SUB_ACCOUNT_ID!;
+      const session = await this.ensureSession();
+
+      // 1. Cancelar todas las órdenes limit del grid
       await grvtCancelAll(session, subAccountId, this.config.pair);
       this.db.cancelAllOrders(this.config.pair);
-      log(this.db, "success", "Todas las órdenes canceladas.");
+      log(this.db, "success", "Órdenes del grid canceladas.");
+
+      // 2. Cerrar posición abierta con market order reduce_only
+      if (privateKey && this.instrumentHash) {
+        const positions = await getPositions(session, subAccountId, this.config.pair);
+        const pos = positions.find((p) => p.instrument === this.config.pair);
+
+        if (pos && Math.abs(parseFloat(pos.size)) > 0) {
+          const rawSize  = Math.abs(parseFloat(pos.size));
+          const sizeStr  = rawSize.toFixed(this.sizeDecimals);
+          const isLong   = parseFloat(pos.size) > 0;
+          // Para market, limitPrice puede ser 0 (ignorado por el exchange)
+          const limitStr = isLong
+            ? (this.currentPrice * 0.99).toFixed(this.priceDecimals) // vender con 1% buffer
+            : (this.currentPrice * 1.01).toFixed(this.priceDecimals);
+
+          log(this.db, "warn", `[EmergencyClose] Cerrando posición ${isLong ? "LONG" : "SHORT"} de ${sizeStr} @ mercado`);
+
+          const closeOrder = await signLimitOrder({
+            subAccountId,
+            instrument:   this.config.pair,
+            instrumentId: this.instrumentHash,
+            size:         sizeStr,
+            limitPrice:   limitStr,
+            isBuying:     !isLong,
+            isMarket:     true,
+            reduceOnly:   true,
+            privateKey,
+            useTestnet,
+            baseDecimals: this.baseDecimals,
+          });
+
+          await createOrder(session, closeOrder);
+          log(this.db, "success", `[EmergencyClose] Posición cerrada.`);
+        }
+      }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      log(this.db, "error", `Error al cancelar órdenes: ${msg}`);
+      log(this.db, "error", `Error en emergencyStop: ${msg}`);
     }
 
     this.db.setConfig("bot_status", "stopped");
@@ -899,12 +1252,14 @@ export class GridEngine {
 
     log(this.db, "success", "Bot activo. Iniciando bucles de polling...\n");
 
-    // Escalonar el arranque de los tres bucles para no saturar la API
+    // Escalonar el arranque de los bucles para no saturar la API
     this.orderPollingLoop();
     await sleep(1_000);
     this.positionPollingLoop();
     await sleep(1_000);
     this.indicatorsPollingLoop();
+    // Grid heal: esperar 15 s para que las órdenes iniciales se asienten en el exchange
+    setTimeout(() => this.gridHealLoop(), 15_000);
 
     // Mantener el proceso vivo hasta que running = false
     await new Promise<void>((resolve) => {

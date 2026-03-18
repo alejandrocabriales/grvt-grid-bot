@@ -50,6 +50,7 @@ import {
   type SpreadOrder,
   type ProtectionState,
   detectMarketRegime,
+  explainMarketRegime,
   generateSpreadOrders,
   generateScalpSignal,
   calculateAdaptiveRange,
@@ -160,6 +161,7 @@ export class VolumeEngine {
   private sizeDecimals = 2;
   private minSize = 0.01;
   private instrumentHash = "";
+  private baseDecimals = 9;
 
   // Market state
   private currentPrice = 0;
@@ -252,6 +254,7 @@ export class VolumeEngine {
         reduceOnly,
         privateKey,
         useTestnet,
+        baseDecimals: this.baseDecimals,
       });
 
       const result = await createOrder(session, signed);
@@ -301,6 +304,7 @@ export class VolumeEngine {
       5
     );
     this.instrumentHash = info.instrumentHash;
+    this.baseDecimals = info.baseDecimals;
     this.priceDecimals = info.priceDecimals;
     this.sizeDecimals = info.sizeDecimals;
     this.minSize = parseFloat(info.minSize);
@@ -310,6 +314,20 @@ export class VolumeEngine {
     this.currentPrice = klines.at(-1)?.close ?? 0;
     if (!this.currentPrice) throw new Error("Could not get current price");
     log(this.db, "info", `Current price: $${this.currentPrice}`);
+
+    // Pre-flight check: verify order size meets minSize before doing anything else
+    const marginPerPair = this.config.totalInvestment / this.config.spreadPairs;
+    const notional = marginPerPair * this.config.leverage;
+    const rawSize = notional / this.currentPrice;
+    const factor = 10 ** this.sizeDecimals;
+    const flooredSize = Math.floor(rawSize * factor) / factor;
+    if (flooredSize < this.minSize) {
+      throw new Error(
+        `Order size too small for ${this.config.pair}: calculated ${flooredSize.toFixed(this.sizeDecimals)} but min_size is ${this.minSize}. ` +
+        `Increase investment to at least $${Math.ceil(this.minSize * this.currentPrice * this.config.spreadPairs / this.config.leverage)} or reduce spreadPairs.`
+      );
+    }
+    log(this.db, "info", `Order size check OK: ${flooredSize.toFixed(this.sizeDecimals)} ${this.config.pair.split("_")[0]} per pair (min: ${this.minSize})`);
 
     // Initial balance
     const session = await this.ensureSession();
@@ -613,6 +631,7 @@ export class VolumeEngine {
       const prevRegime = this.regime;
       if (this.indicators) {
         this.regime = detectMarketRegime(this.indicators, this.config.maxVolatilityRatio);
+        log(this.db, "info", `[Regime] ${this.regime} | ${explainMarketRegime(this.indicators)}`);
       }
 
       if (this.regime !== prevRegime) {
